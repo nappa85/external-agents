@@ -1,0 +1,14 @@
+[project]
+name = "external-agents"
+version = "0.1.0"
+description = "An agent skill for using other agent CLIs as confined reviewers and sandboxed coding agents"
+requires-python = ">=3.11"
+
+[tool.ruff]
+line-length = 120
+src = ["skills/external-agents/scripts", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP"]
+# The formatter owns line length; long lines left are string literals.
+ignore = ["E501"]
