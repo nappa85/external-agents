@@ -114,7 +114,7 @@ class Mailbox(unittest.TestCase):
         asker = self.ask("never mind")
         self.wait_for_question()
         asker.kill()
-        asker.wait()
+        asker.communicate()
         deadline = time.monotonic() + 5
         while self.box.pending and time.monotonic() < deadline:
             time.sleep(0.05)
