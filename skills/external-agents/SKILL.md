@@ -2,6 +2,7 @@
 name: external-agents
 description: Runs other agent CLIs (Codex, Claude Code, opencode, Amp) as confined independent reviewers of a plan or change, or as coding agents sandboxed with bubblewrap on a git worktree, installing their pinned CLIs when missing. Use when work needs a reviewer from another model family, when the user configures EXTERNAL_REVIEWERS or EXTERNAL_CODER, or when the user asks to delegate implementation to an external agent.
 compatibility: Needs python3 3.11+ and git. Reviews run on Linux and macOS; the coding sandbox needs Linux with bubblewrap and unprivileged user namespaces. Each backend needs its own CLI and credentials.
+license: MIT. Complete terms in LICENSE.txt
 ---
 
 # External Agents
