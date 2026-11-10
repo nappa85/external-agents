@@ -351,23 +351,25 @@ def review_with_fallback(
     real review that the completeness check missed is not lost."""
     log = []
     for reviewer in reviewers:
-        if reviewer.free and limited_today(reviewer):
-            log.append(f"{reviewer.label}: skipped (limited earlier today)")
-            print(f"{reviewer.label}: limited earlier today; trying the next reviewer.", file=sys.stderr)
-            continue
+        # The ledger is read and written under the lock, so a slot or review that waited
+        # for it sees a limit the run before it just recorded.
         with free_tier_lock(reviewer):
+            if reviewer.free and limited_today(reviewer):
+                log.append(f"{reviewer.label}: skipped (limited earlier today)")
+                print(f"{reviewer.label}: limited earlier today; trying the next reviewer.", file=sys.stderr)
+                continue
             if options.preflight and not preflight(reviewer, pristine):
                 log.append(f"{reviewer.label}: preflight failed")
                 continue
             code, output, changes = attempt(reviewer, pristine, INSTRUCTION, options.total, options.idle)
-        state = classify(code, output, options.expect)
+            state = classify(code, output, options.expect)
+            if reviewer.free and state in ("stalled", "unavailable"):
+                # Free tiers rarely say "limit": a stall or a failure stops spending runs on
+                # the model for the day.
+                state = f"{state}, likely a free-tier limit"
+                mark_limited(reviewer, state)
         if state == "ok":
             return reviewer, output, changes
-        if reviewer.free and state in ("stalled", "unavailable"):
-            # Free tiers rarely say "limit": a stall or a failure stops spending runs on the
-            # model for the day.
-            state = f"{state}, likely a free-tier limit"
-            mark_limited(reviewer, state)
         entry = f"{reviewer.label}: {state} (exit {code})"
         if state == "incomplete":
             entry += "\n--- incomplete output ---\n" + output.strip()

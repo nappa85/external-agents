@@ -460,6 +460,19 @@ class FreeTierAndCompletenessTests(Sandbox):
         ledger = json.loads((self.root / "state/external-agents/limits.json").read_text())
         self.assertEqual(list(ledger), ["opencode:p/a-free"])
 
+    def test_a_slot_waiting_for_a_free_model_sees_the_limit_the_other_slot_recorded(self) -> None:
+        self.fake("opencode", 'case "$*" in *a-free*) sleep 30;; *) echo "review by $*";; esac')
+        spec = "opencode:p/a-free | opencode:p/b"
+
+        result = self.run_script(
+            "review", "--prompt-file", str(self.prompt), "--output-dir", str(self.root / "reviews"),
+            "--no-preflight", "--reviewers", f"{spec}; {spec}", "--idle-timeout", "1",
+        )  # fmt: skip
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stderr.count("opencode:p/a-free: stalled"), 1, result.stderr)
+        self.assertEqual(result.stderr.count("opencode:p/a-free: limited earlier today"), 1, result.stderr)
+
     def test_an_output_without_the_expected_text_is_kept_but_not_accepted(self) -> None:
         self.fake("claude", "echo 'I looked at things.'")
 
