@@ -23,7 +23,7 @@ skills/external-agents/scripts/
    untracked non-ignored files. Each is copied unless its name looks like a secret
    (`.env*`, `.envrc`, `*.key`, `*.pem`, `id_*`, `credentials*.json`, `.npmrc`, ...) or
    it sits in `.git` or `.jj`. Only relative symlinks to non-secret files inside the tree
-   are kept. A final scan fails the run if a secret-like file survived.
+   are kept, and a path whose directory resolves outside the tree is skipped. A final scan fails the run if a secret-like file survived.
 2. **Handoff.** The prompt, the diff (filtered the same way, header by header; an
    unparsable header drops its file), and a changed-path manifest are written into the
    snapshot.

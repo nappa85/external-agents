@@ -163,6 +163,19 @@ class SnapshotTests(Sandbox):
         links = sorted(p.name for p in dest.iterdir() if p.is_symlink())
         self.assertEqual(links, ["relative"])
 
+    def test_a_directory_replaced_by_a_link_out_of_the_tree_is_not_followed(self) -> None:
+        outside = self.root / "outside"
+        outside.mkdir()
+        (outside / "lib.rs").write_text("private, outside the checkout\n")
+        shutil.rmtree(self.repo / "src")
+        (self.repo / "src").symlink_to(outside, target_is_directory=True)
+        dest = self.root / "snapshot"
+
+        snapshot.snapshot(self.repo, dest, [])
+
+        self.assertFalse((dest / "src").exists())
+        self.assertTrue((dest / "AGENTS.md").is_file())
+
     def test_include_outside_the_source_is_refused(self) -> None:
         outside = self.root / "outside.md"
         outside.write_text("x\n")

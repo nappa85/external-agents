@@ -31,13 +31,17 @@ def copy_entry(source: Path, dest: Path, relative: Path) -> None:
     target = dest / relative
     if not origin.is_symlink() and not origin.is_file():
         return  # deleted in the working tree but still in the index
+    root = source.resolve()
+    if not origin.parent.resolve().is_relative_to(root):
+        # A directory in the index replaced by a link that leaves the tree: Git still
+        # lists its old paths, which now name files outside the checkout.
+        return
     target.parent.mkdir(parents=True, exist_ok=True)
     if origin.is_symlink():
         # Keep only relative links to non-secret files in the tree; an absolute link
         # would still point into the checkout.
         link = os.readlink(origin)
         resolved = (origin.parent / link).resolve()
-        root = source.resolve()
         if not os.path.isabs(link) and resolved.is_relative_to(root) and not is_secret(resolved.relative_to(root)):
             os.symlink(link, target)
         return
