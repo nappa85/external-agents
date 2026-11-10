@@ -120,6 +120,21 @@ class SnapshotTests(Sandbox):
         self.assertIn("+fn new() {}", diff)
         self.assertEqual(names, "M\tsrc/lib.rs\nA\tsrc/new.rs\n")
 
+    def test_base_diff_does_not_depend_on_the_users_diff_configuration(self) -> None:
+        self.write("src/lib.rs", "fn changed() {}\n")
+        self.write("src/new.rs", "fn new() {}\n")
+
+        for key, value in (("diff.noprefix", "true"), ("diff.mnemonicPrefix", "true"), ("diff.external", "false")):
+            with self.subTest(key):
+                git(self.repo, "config", key, value)
+                try:
+                    diff, names = snapshot.filter_patch(snapshot.base_diff(self.repo, "HEAD"))
+                finally:
+                    git(self.repo, "config", "--unset", key)
+
+                self.assertIn("+fn changed() {}", diff)
+                self.assertEqual(names, "M\tsrc/lib.rs\nA\tsrc/new.rs\n")
+
     def test_diff_omits_tracked_and_untracked_secret_files(self) -> None:
         self.write("config/.env", "TOKEN=old\n")
         self.write("certs/server.key", "old-key\n")

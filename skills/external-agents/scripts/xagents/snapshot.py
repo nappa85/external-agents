@@ -106,14 +106,20 @@ def filter_patch(patch: str) -> tuple[str, str]:
     return "".join(kept), "".join(f"{name}\n" for name in names)
 
 
+# Override the user's diff configuration: `diff.noprefix` or `diff.mnemonicPrefix` would make
+# every header unparsable, so `filter_patch` would drop every file, and `diff.external`
+# would replace the patch.
+DIFF_OPTIONS = ("--no-color", "--no-ext-diff", "--no-relative", "--src-prefix=a/", "--dst-prefix=b/")
+
+
 def base_diff(source: Path, base: str) -> str:
     """Diff from `base` to the working tree, including untracked non-ignored files."""
-    diff = git(source, "diff", "--no-color", base, "--")
+    diff = git(source, "diff", *DIFF_OPTIONS, base, "--")
     untracked = git(source, "ls-files", "-z", "--others", "--exclude-standard")
     for entry in filter(None, untracked.split("\0")):
         # `git diff --no-index` exits 1 when the files differ, which is always the case here.
         result = subprocess.run(
-            ["git", "-C", str(source), "diff", "--no-color", "--no-index", "--", "/dev/null", entry],
+            ["git", "-C", str(source), "diff", *DIFF_OPTIONS, "--no-index", "--", "/dev/null", entry],
             capture_output=True,
             text=True,
         )
