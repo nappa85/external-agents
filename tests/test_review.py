@@ -84,6 +84,7 @@ class SnapshotTests(Sandbox):
         self.write("config/.env.example", "TOKEN=\n")
         self.write("certs/server.key", "secret\n")
         self.write("docs/.npmrc", "//registry.example/:_authToken=secret\n")
+        self.write("logs/audit.jsonl", '{"tool": "bash", "input": "export TOKEN=secret"}\n')
         self.write("examples/.tool/config.toml", "key = 1\n")
         self.write(".agents/plans/change.md", "plan\n")
         dest = self.root / "snapshot"
@@ -120,6 +121,21 @@ class SnapshotTests(Sandbox):
         self.assertIn("+fn new() {}", diff)
         self.assertEqual(names, "M\tsrc/lib.rs\nA\tsrc/new.rs\n")
 
+    def test_base_diff_does_not_depend_on_the_users_diff_configuration(self) -> None:
+        self.write("src/lib.rs", "fn changed() {}\n")
+        self.write("src/new.rs", "fn new() {}\n")
+
+        for key, value in (("diff.noprefix", "true"), ("diff.mnemonicPrefix", "true"), ("diff.external", "false")):
+            with self.subTest(key):
+                git(self.repo, "config", key, value)
+                try:
+                    diff, names = snapshot.filter_patch(snapshot.base_diff(self.repo, "HEAD"))
+                finally:
+                    git(self.repo, "config", "--unset", key)
+
+                self.assertIn("+fn changed() {}", diff)
+                self.assertEqual(names, "M\tsrc/lib.rs\nA\tsrc/new.rs\n")
+
     def test_diff_omits_tracked_and_untracked_secret_files(self) -> None:
         self.write("config/.env", "TOKEN=old\n")
         self.write("certs/server.key", "old-key\n")
@@ -147,6 +163,19 @@ class SnapshotTests(Sandbox):
 
         links = sorted(p.name for p in dest.iterdir() if p.is_symlink())
         self.assertEqual(links, ["relative"])
+
+    def test_a_directory_replaced_by_a_link_out_of_the_tree_is_not_followed(self) -> None:
+        outside = self.root / "outside"
+        outside.mkdir()
+        (outside / "lib.rs").write_text("private, outside the checkout\n")
+        shutil.rmtree(self.repo / "src")
+        (self.repo / "src").symlink_to(outside, target_is_directory=True)
+        dest = self.root / "snapshot"
+
+        snapshot.snapshot(self.repo, dest, [])
+
+        self.assertFalse((dest / "src").exists())
+        self.assertTrue((dest / "AGENTS.md").is_file())
 
     def test_include_outside_the_source_is_refused(self) -> None:
         outside = self.root / "outside.md"
@@ -431,6 +460,19 @@ class FreeTierAndCompletenessTests(Sandbox):
         ledger = json.loads((self.root / "state/external-agents/limits.json").read_text())
         self.assertEqual(list(ledger), ["opencode:p/a-free"])
 
+    def test_a_slot_waiting_for_a_free_model_sees_the_limit_the_other_slot_recorded(self) -> None:
+        self.fake("opencode", 'case "$*" in *a-free*) sleep 30;; *) echo "review by $*";; esac')
+        spec = "opencode:p/a-free | opencode:p/b"
+
+        result = self.run_script(
+            "review", "--prompt-file", str(self.prompt), "--output-dir", str(self.root / "reviews"),
+            "--no-preflight", "--reviewers", f"{spec}; {spec}", "--idle-timeout", "1",
+        )  # fmt: skip
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stderr.count("opencode:p/a-free: stalled"), 1, result.stderr)
+        self.assertEqual(result.stderr.count("opencode:p/a-free: limited earlier today"), 1, result.stderr)
+
     def test_an_output_without_the_expected_text_is_kept_but_not_accepted(self) -> None:
         self.fake("claude", "echo 'I looked at things.'")
 
@@ -441,6 +483,15 @@ class FreeTierAndCompletenessTests(Sandbox):
             self.output.read_text(),
             "no reviewer available:\nclaude: incomplete (exit 0)\n--- incomplete output ---\nI looked at things.\n",
         )
+
+    def test_an_invalid_expected_pattern_is_a_usage_error(self) -> None:
+        self.fake("claude", "echo 'Verdict: fine.'")
+
+        result = self.panel("claude", "--expect", "verdict[")
+
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("--expect: not a valid regex", result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
 
     def test_a_silent_run_killed_for_idleness_is_stalled(self) -> None:
         self.assertEqual(review.classify(124, "partial\n[killed: idle timeout]"), "stalled")

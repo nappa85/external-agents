@@ -363,6 +363,19 @@ def cpu_list(requested: int | None) -> list[int] | None:
     return allowed[:requested]
 
 
+# Pins and lowers the priority of the launched sandbox, then execs it. This runs as its own
+# program: a `preexec_fn` would run Python in the forked child while the proxy and mailbox
+# threads are alive, which can deadlock it before exec.
+CONFINE = """\
+import os, sys
+cpus = {int(cpu) for cpu in sys.argv[1].split(",") if cpu}
+if cpus:
+    os.sched_setaffinity(0, cpus)
+os.nice(10)
+os.execvp(sys.argv[2], sys.argv[2:])
+"""
+
+
 def code(args: argparse.Namespace, command: list[str] | None) -> int:
     if shutil.which("bwrap") is None:
         fail("bubblewrap is not installed; run `external_agents.py install bubblewrap`")
@@ -440,11 +453,6 @@ def code(args: argparse.Namespace, command: list[str] | None) -> int:
     argv += [python, "-I", f"{TOOL_DIR}/forward.py", *command]
     print(f"xagents: run {run.name}, egress {', '.join(hosts) or 'none'}", file=sys.stderr)
 
-    def confine() -> None:
-        if cpus:
-            os.sched_setaffinity(0, cpus)
-        os.nice(10)
-
     # bwrap reads the filter from descriptor 9 (`--seccomp 9`).
     filtered = (run / "seccomp.bpf").exists()
     if filtered:
@@ -453,7 +461,10 @@ def code(args: argparse.Namespace, command: list[str] | None) -> int:
             os.dup2(bpf, 9, inheritable=True)
             os.close(bpf)
     try:
-        child = subprocess.Popen(argv, pass_fds=(9,) if filtered else (), preexec_fn=confine)
+        child = subprocess.Popen(
+            [sys.executable, "-I", "-c", CONFINE, ",".join(map(str, cpus or [])), *argv],
+            pass_fds=(9,) if filtered else (),
+        )
         try:
             code = child.wait(timeout=args.timeout)
         except subprocess.TimeoutExpired:

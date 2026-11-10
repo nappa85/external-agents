@@ -175,6 +175,31 @@ class Mailbox(unittest.TestCase):
             mailbox.request(self.state, {"op": "question"})
 
 
+class NoRun(unittest.TestCase):
+    """`question` and `answer` exit 4, not with a traceback, whenever no run serves them."""
+
+    def assert_not_running(self, state: Path) -> None:
+        for args in (["question"], ["answer", "text"]):
+            with self.subTest(args[0]):
+                result = subprocess.run(
+                    [sys.executable, "-I", str(SCRIPT), *args, "--state", str(state)],
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                )
+                self.assertEqual(result.returncode, 4, result.stderr)
+                self.assertNotIn("Traceback", result.stderr)
+
+    def test_a_state_directory_that_does_not_exist_yet(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assert_not_running(Path(tmp) / "state")
+
+    def test_a_latest_link_whose_run_directory_was_removed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "latest").symlink_to("run-1")
+            self.assert_not_running(Path(tmp))
+
+
 class LongPaths(unittest.TestCase):
     def test_sockets_work_below_paths_longer_than_the_socket_limit(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

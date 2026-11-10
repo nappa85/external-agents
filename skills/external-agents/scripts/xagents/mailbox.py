@@ -290,7 +290,11 @@ class NotRunning(Exception):
 
 def latest_run(state: Path) -> int:
     """The latest run directory, opened without following links below `state`."""
-    state_fd = os.open(state, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        # The coordinator may start waiting before the launcher creates the directory.
+        state_fd = os.open(state, os.O_RDONLY | os.O_DIRECTORY)
+    except FileNotFoundError as error:
+        raise NotRunning("no run has started in this state directory") from error
     try:
         try:
             latest = os.readlink("latest", dir_fd=state_fd)
@@ -298,7 +302,10 @@ def latest_run(state: Path) -> int:
             raise NotRunning("no run has started in this state directory") from error
         if "/" in latest or not latest.startswith("run-"):
             raise UsageError("latest run link is not a run directory")
-        return os.open(latest, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=state_fd)
+        try:
+            return os.open(latest, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=state_fd)
+        except FileNotFoundError as error:
+            raise NotRunning("the latest run directory was removed") from error
     finally:
         os.close(state_fd)
 

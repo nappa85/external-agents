@@ -31,13 +31,17 @@ def copy_entry(source: Path, dest: Path, relative: Path) -> None:
     target = dest / relative
     if not origin.is_symlink() and not origin.is_file():
         return  # deleted in the working tree but still in the index
+    root = source.resolve()
+    if not origin.parent.resolve().is_relative_to(root):
+        # A directory in the index replaced by a link that leaves the tree: Git still
+        # lists its old paths, which now name files outside the checkout.
+        return
     target.parent.mkdir(parents=True, exist_ok=True)
     if origin.is_symlink():
         # Keep only relative links to non-secret files in the tree; an absolute link
         # would still point into the checkout.
         link = os.readlink(origin)
         resolved = (origin.parent / link).resolve()
-        root = source.resolve()
         if not os.path.isabs(link) and resolved.is_relative_to(root) and not is_secret(resolved.relative_to(root)):
             os.symlink(link, target)
         return
@@ -106,14 +110,20 @@ def filter_patch(patch: str) -> tuple[str, str]:
     return "".join(kept), "".join(f"{name}\n" for name in names)
 
 
+# Override the user's diff configuration: `diff.noprefix` or `diff.mnemonicPrefix` would make
+# every header unparsable, so `filter_patch` would drop every file, and `diff.external`
+# would replace the patch.
+DIFF_OPTIONS = ("--no-color", "--no-ext-diff", "--no-relative", "--src-prefix=a/", "--dst-prefix=b/")
+
+
 def base_diff(source: Path, base: str) -> str:
     """Diff from `base` to the working tree, including untracked non-ignored files."""
-    diff = git(source, "diff", "--no-color", base, "--")
+    diff = git(source, "diff", *DIFF_OPTIONS, base, "--")
     untracked = git(source, "ls-files", "-z", "--others", "--exclude-standard")
     for entry in filter(None, untracked.split("\0")):
         # `git diff --no-index` exits 1 when the files differ, which is always the case here.
         result = subprocess.run(
-            ["git", "-C", str(source), "diff", "--no-color", "--no-index", "--", "/dev/null", entry],
+            ["git", "-C", str(source), "diff", *DIFF_OPTIONS, "--no-index", "--", "/dev/null", entry],
             capture_output=True,
             text=True,
         )

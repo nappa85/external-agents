@@ -361,6 +361,8 @@ class LiveSandbox(unittest.TestCase):
         "libc = ctypes.CDLL(None, use_errno=True)\n"
         "print('ptrace', libc.ptrace(0, 0, 0, 0), ctypes.get_errno())\n"
         "print('home', sorted(os.listdir(os.path.expanduser('~'))))\n"
+        "print('nice', os.nice(0))\n"
+        "print('cpus', len(os.sched_getaffinity(0)))\n"
         "open('written.txt', 'w').write('ok')\n"
     )
 
@@ -373,7 +375,7 @@ class LiveSandbox(unittest.TestCase):
             (tree / "vendor/.git/config").write_text("[core]\n")
             out = subprocess.run(
                 [sys.executable, "-I", str(SCRIPT), "code", "--worktree", str(tree), "--state", str(Path(tmp, "state")),
-                 "--", sys.executable, "-I", "-c", self.PROBE],
+                 "--cpus", "1", "--", sys.executable, "-I", "-c", self.PROBE],
                 capture_output=True, text=True, timeout=120,
             )  # fmt: skip
             self.assertEqual(out.returncode, 0, out.stderr)
@@ -387,6 +389,8 @@ class LiveSandbox(unittest.TestCase):
                 self.assertEqual(lines["ptrace"], "-1 1")
             self.assertEqual(lines["fds"], "[]")  # nothing inherited beyond stdio
             self.assertEqual(lines["home"], "[]")
+            self.assertEqual(lines["nice"], str(os.nice(0) + 10))
+            self.assertEqual(lines["cpus"], "1")
             self.assertEqual((tree / "written.txt").read_text(), "ok")
             self.assertTrue((tree / ".git").read_text().startswith("gitdir: "))
             self.assertNotIn("planted", (tree / ".git").read_text())

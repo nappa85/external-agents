@@ -52,6 +52,8 @@ SECRET_PATTERNS = (
     ".pypirc",
     ".pgpass",
     "credentials*.json",
+    # Agent audit logs, such as OpenFirma's, record tool calls with their arguments.
+    "audit.jsonl",
 )
 SECRET_ALLOWED = (".env.example", ".env.sample", ".env.template")
 # Version-control metadata: never copied, and masked in a coding sandbox, because hooks and
