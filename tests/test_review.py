@@ -84,6 +84,7 @@ class SnapshotTests(Sandbox):
         self.write("config/.env.example", "TOKEN=\n")
         self.write("certs/server.key", "secret\n")
         self.write("docs/.npmrc", "//registry.example/:_authToken=secret\n")
+        self.write("logs/audit.jsonl", '{"tool": "bash", "input": "export TOKEN=secret"}\n')
         self.write("examples/.tool/config.toml", "key = 1\n")
         self.write(".agents/plans/change.md", "plan\n")
         dest = self.root / "snapshot"

@@ -21,9 +21,10 @@ skills/external-agents/scripts/
 
 1. **Snapshot.** `git ls-files --cached --others --exclude-standard` lists tracked and
    untracked non-ignored files. Each is copied unless its name looks like a secret
-   (`.env*`, `.envrc`, `*.key`, `*.pem`, `id_*`, `credentials*.json`, `.npmrc`, ...) or
-   it sits in `.git` or `.jj`. Only relative symlinks to non-secret files inside the tree
-   are kept, and a path whose directory resolves outside the tree is skipped. A final scan fails the run if a secret-like file survived.
+   (`.env*`, `.envrc`, `*.key`, `*.pem`, `id_*`, `credentials*.json`, `.npmrc`,
+   `audit.jsonl`, ...) or it sits in `.git` or `.jj`. Only relative symlinks to non-secret
+   files inside the tree are kept, and a path whose directory resolves outside the tree is
+   skipped. A final scan fails the run if a secret-like file survived.
 2. **Handoff.** The prompt, the diff (filtered the same way, header by header; an
    unparsable header drops its file), and a changed-path manifest are written into the
    snapshot.
