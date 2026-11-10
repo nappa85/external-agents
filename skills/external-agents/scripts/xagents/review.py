@@ -392,9 +392,7 @@ def review_slot(
     not reach the next one."""
     if not slot.reviewers:
         return None, "no backend is installed or configured", b""
-    options = Options(
-        args.timeout, args.idle_timeout, not args.no_preflight, re.compile(args.expect) if args.expect else None
-    )
+    options = Options(args.timeout, args.idle_timeout, not args.no_preflight, args.expect)
     with tempfile.TemporaryDirectory(prefix="xagents-review-") as tmp:
         pristine = Path(tmp) / "pristine"
         snapshot(source, pristine, args.include)
@@ -469,6 +467,13 @@ def review(args: argparse.Namespace) -> int:
     return 0
 
 
+def expect_pattern(text: str) -> re.Pattern[str]:
+    try:
+        return re.compile(text)
+    except re.error as error:
+        raise argparse.ArgumentTypeError(f"not a valid regex: {error}") from error
+
+
 def add_parser(commands: argparse._SubParsersAction) -> None:
     run = commands.add_parser("review", help="Run the reviewer panel on a snapshot of a Git checkout")
     run.add_argument("--source", type=Path, default=Path("."), help="Checkout to snapshot")
@@ -487,7 +492,7 @@ def add_parser(commands: argparse._SubParsersAction) -> None:
         help=f"backend[:model] to try, repeatable in fallback order, as one slot; overrides {ENV_REVIEWERS}",
     )
     chosen.add_argument("--reviewers", help=f"A whole panel in {ENV_REVIEWERS} syntax; overrides it")
-    run.add_argument("--expect", help="Regex a usable review must match, such as a verdict line")
+    run.add_argument("--expect", type=expect_pattern, help="Regex a usable review must match, such as a verdict line")
     run.add_argument("--timeout", type=float, default=1800)
     run.add_argument("--idle-timeout", type=float, default=300)
     run.add_argument("--no-preflight", action="store_true")

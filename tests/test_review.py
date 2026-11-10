@@ -484,6 +484,15 @@ class FreeTierAndCompletenessTests(Sandbox):
             "no reviewer available:\nclaude: incomplete (exit 0)\n--- incomplete output ---\nI looked at things.\n",
         )
 
+    def test_an_invalid_expected_pattern_is_a_usage_error(self) -> None:
+        self.fake("claude", "echo 'Verdict: fine.'")
+
+        result = self.panel("claude", "--expect", "verdict[")
+
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("--expect: not a valid regex", result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+
     def test_a_silent_run_killed_for_idleness_is_stalled(self) -> None:
         self.assertEqual(review.classify(124, "partial\n[killed: idle timeout]"), "stalled")
         self.assertEqual(review.classify(124, "partial\n[killed: total timeout]"), "unavailable")
