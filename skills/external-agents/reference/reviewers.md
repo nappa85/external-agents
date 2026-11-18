@@ -69,6 +69,15 @@ needed: run `amp login` once, or export `AMP_API_KEY`. List model IDs with
 `amp plugins show-agent-options`; the review entry takes the `provider/model` ID, not
 the mode key that `amp --mode` uses.
 
+Without a suffix, Amp runs the reviewer at its default reasoning effort, `medium`. A model
+that does not support it fails preflight with `Reasoning effort "medium" is not
+supported`. Append `@effort` with one of the efforts that `amp plugins show-agent-options
+--json` lists for the model, such as `amp:deepseek/deepseek-v4.1-flash@high`.
+
+Every backend takes the `@effort` suffix: `none`, `minimal`, `low`, `medium`, `high`,
+`xhigh`, or `max`. `claude` accepts only `low` through `max`, for example
+`claude:sonnet@high`.
+
 Amp's built-in modes have shell and edit tools, so the wrapper never uses them for a
 review. It writes a project plugin into the snapshot that registers an
 `external-reviewer` mode whose agent has only `Read`, `create_file`, and `edit_file`,

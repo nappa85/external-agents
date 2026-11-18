@@ -345,6 +345,42 @@ class ReviewerSelectionTests(Sandbox):
         self.assertEqual(result.returncode, 2)
         self.assertIn("explicit model", result.stderr)
 
+    def test_only_a_known_effort_suffix_is_split_from_the_model(self) -> None:
+        self.fake("amp", "echo review")
+        self.fake("opencode", "echo review")
+        panel = "amp:deepseek/deepseek-v4.1-flash@high; opencode:google-vertex/claude-sonnet-4@20250514"
+
+        result = self.run_script("detect", env={"EXTERNAL_REVIEWERS": panel})
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        chains = [slot["chain"] for slot in json.loads(result.stdout)["reviewers"]["panel"]]
+        self.assertEqual(
+            chains, [["amp:deepseek/deepseek-v4.1-flash@high"], ["opencode:google-vertex/claude-sonnet-4@20250514"]]
+        )
+
+    def test_an_effort_claude_does_not_accept_is_a_usage_error(self) -> None:
+        self.fake("claude", "echo review")
+
+        result = self.run_script("detect", env={"EXTERNAL_REVIEWERS": "claude:sonnet@minimal"})
+
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("claude takes no reasoning effort 'minimal'", result.stderr)
+
+    def test_each_cli_backend_receives_the_effort_in_its_own_flag(self) -> None:
+        for spec, expected in (
+            ("codex:gpt-6.1-sol@xhigh", '-c model_reasoning_effort="xhigh"'),
+            ("claude:sonnet@max", "--effort max --"),
+            ("opencode:opencode/deepseek-v4.1-flash-free@high", "--agent reviewer --variant high"),
+        ):
+            backend = spec.partition(":")[0]
+            with self.subTest(backend=backend):
+                self.fake(backend, 'echo "$@"')
+
+                result = self.review("--reviewer", spec)
+
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn(expected, self.output.read_text())
+
     def test_short_provider_error_on_success_counts_as_unavailable(self) -> None:
         self.assertEqual(review.classify(0, "Error: rate limit reached, try later."), "unavailable")
         self.assertEqual(review.classify(0, "> reviewer\n\u2717 API Error: 429 quota exceeded"), "unavailable")
@@ -431,6 +467,21 @@ class ReviewerSelectionTests(Sandbox):
             ],
         )
         self.assertRegex(lines[5], r"--settings-file \S+/snapshot/\.amp/settings\.json --mode external-reviewer ")
+
+    def test_amp_reviewer_effort_reaches_the_generated_agent(self) -> None:
+        self.fake("amp", "grep -E 'model|reasoningEffort' .amp/plugins/external-reviewer.ts")
+
+        result = self.review("--reviewer", "amp:deepseek/deepseek-v4.1-flash@high", env={"AMP_API_KEY": "amp"})
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            self.output.read_text().splitlines()[:3],
+            [
+                "reviewer: amp:deepseek/deepseek-v4.1-flash@high",
+                '\t\tmodel: "deepseek/deepseek-v4.1-flash",',
+                '\t\treasoningEffort: "high",',
+            ],
+        )
 
     def test_passthrough_keeps_a_named_credential(self) -> None:
         self.fake("claude", 'echo "mistral=${MISTRAL_API_KEY:-unset}"')

@@ -91,7 +91,7 @@ import type {{ PluginAPI }} from '@ampcode/plugin'
 export default function (amp: PluginAPI) {{
 	const agent = amp.createAgent({{
 		model: {model},
-		tools: {{ include: ['Read', 'create_file', 'edit_file'], exclude: ['tool_search', 'code_exec'] }},
+		tools: {{ include: ['Read', 'create_file', 'edit_file'], exclude: ['tool_search', 'code_exec'] }},{effort}
 		instructions: 'You are a reviewer. You can read and change files in your working directory but cannot run commands.',
 	}})
 	amp.registerAgentMode({{ key: '{mode}', label: '{mode}', agent: agent.definition }})
@@ -117,14 +117,23 @@ def amp_settings(snap: Path) -> dict[str, object]:
     return {"amp.permissions": [*rules, {"tool": "*", "action": "reject"}]}
 
 
+# Reasoning efforts a reviewer spec may end in, as `@effort`. codex, opencode and amp pass
+# any of them to the provider, which accepts a subset per model; Claude Code accepts only
+# its own list and silently ignores anything else, so the wrapper checks that one.
+EFFORTS = ("none", "minimal", "low", "medium", "high", "xhigh", "max")
+BACKEND_EFFORTS = {"claude": ("low", "medium", "high", "xhigh", "max")}
+
+
 @dataclass(frozen=True)
 class Reviewer:
     backend: str
     model: str | None
+    effort: str | None = None
 
     @property
     def label(self) -> str:
-        return f"{self.backend}:{self.model}" if self.model else self.backend
+        label = f"{self.backend}:{self.model}" if self.model else self.backend
+        return f"{label}@{self.effort}" if self.effort else label
 
     @property
     def idle_timeout_applies(self) -> bool:
@@ -139,10 +148,11 @@ class Reviewer:
     def command(self, snap: Path, instruction: str, last_message: Path) -> list[str]:
         model = ["--model", self.model] if self.model else []
         if self.backend == "codex":
+            effort = ["-c", f'model_reasoning_effort="{self.effort}"'] if self.effort else []
             return [
                 "codex", "exec", "--sandbox", "workspace-write", "--skip-git-repo-check",
                 "--color", "never", "--cd", str(snap),
-                "--output-last-message", str(last_message), *model, instruction,
+                "--output-last-message", str(last_message), *model, *effort, instruction,
             ]  # fmt: skip
         if self.backend == "claude":
             # No `Read` rule: an unscoped one also allows reads outside the working directory,
@@ -153,15 +163,20 @@ class Reviewer:
                 # User settings only: project settings in the reviewed tree could add hooks.
                 "claude", "-p", "--tools", "Read,Glob,Grep,Edit,Write", "--permission-mode", "dontAsk",
                 "--allowedTools", *edits, "--strict-mcp-config", "--setting-sources", "user",
-                "--no-session-persistence", *model, "--", instruction,
+                "--no-session-persistence", *model, *(["--effort", self.effort] if self.effort else []),
+                "--", instruction,
             ]  # fmt: skip
         if self.backend == "amp":
             return [
                 "amp", "--settings-file", str(snap / AMP_SETTINGS), "--mode", AMP_MODE,
                 "--visibility", "private", "--no-notifications", "--no-ide", "-x", instruction,
             ]  # fmt: skip
+        # opencode calls an effort a variant.
+        effort = ["--variant", self.effort] if self.effort else []
         # opencode takes its project from `$PWD`, not the process cwd; pin it with --dir.
-        return ["opencode", "run", "--dir", str(snap), "-m", str(self.model), "--agent", "reviewer", instruction]
+        return [
+            "opencode", "run", "--dir", str(snap), "-m", str(self.model), "--agent", "reviewer", *effort, instruction,
+        ]  # fmt: skip
 
     @property
     def owned_paths(self) -> tuple[Path, ...]:
@@ -182,12 +197,23 @@ class Reviewer:
             plugins = snap / AMP_PLUGINS
             plugins.mkdir(parents=True)
             model = json.dumps(self.model)
-            write_generated(plugins / f"{AMP_MODE}.ts", AMP_PLUGIN.format(mode=AMP_MODE, model=model))
+            effort = f"\n\t\treasoningEffort: {json.dumps(self.effort)}," if self.effort else ""
+            plugin = AMP_PLUGIN.format(mode=AMP_MODE, model=model, effort=effort)
+            write_generated(plugins / f"{AMP_MODE}.ts", plugin)
             write_generated(snap / AMP_SETTINGS, json.dumps(amp_settings(snap), indent=2))
 
 
 def parse_reviewer(spec: str) -> Reviewer:
-    return Reviewer(*parse_agent(spec, REVIEW_MODEL_REQUIRED))
+    """`backend[:model][@effort]`. Only a known effort counts as a suffix, so a model ID
+    containing `@`, such as a dated Vertex model, keeps its `@`."""
+    head, at, effort = spec.strip().rpartition("@")
+    if not at or effort not in EFFORTS:
+        return Reviewer(*parse_agent(spec, REVIEW_MODEL_REQUIRED))
+    backend, model = parse_agent(head, REVIEW_MODEL_REQUIRED)
+    allowed = BACKEND_EFFORTS.get(backend, EFFORTS)
+    if effort not in allowed:
+        raise UsageError(f"{backend} takes no reasoning effort {effort!r}; expected one of {', '.join(allowed)}")
+    return Reviewer(backend, model, effort)
 
 
 @dataclass(frozen=True)

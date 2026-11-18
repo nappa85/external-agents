@@ -39,8 +39,22 @@ An agent is `backend[:model]`:
 ```
 panel    = slot { ";" slot }
 slot     = [ "?" ] reviewer { ( "|" | "," ) reviewer }
-reviewer = backend [ ":" model ]
+reviewer = backend [ ":" model ] [ "@" effort ]
 ```
+
+`effort` sets the reviewer's reasoning effort: `none`, `minimal`, `low`, `medium`,
+`high`, `xhigh`, or `max`. `claude` accepts only `low` through `max`; the other backends
+pass the effort on and the provider rejects one the model does not support.
+
+| Backend    | Passed as                          |
+| ---------- | ---------------------------------- |
+| `codex`    | `-c model_reasoning_effort="..."`  |
+| `claude`   | `--effort`                         |
+| `opencode` | `--variant`                        |
+| `amp`      | generated agent `reasoningEffort` |
+
+A suffix that is not one of these efforts stays part of the model ID, so a model such
+as `claude-sonnet-4@20250514` is unaffected.
 
 Slots run in parallel and produce one review each. Within a slot, reviewers are tried in
 order until one produces a review. A `?` slot is optional. Reviewers whose CLI is not
