@@ -1,0 +1,58 @@
+# Changelog
+
+All notable changes to this project are documented in this file.
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [0.1.2] - 2026-11-18
+
+### Added
+
+- A reviewer spec can end in `@effort` to set the reviewer's reasoning effort: `none`, `minimal`,
+  `low`, `medium`, `high`, `xhigh` or `max`. Amp otherwise runs at `medium`, which some models
+  reject at preflight. `claude` accepts only `low` through `max`. A suffix that is not a known
+  effort stays part of the model ID.
+- This changelog.
+
+### Changed
+
+- The version in `pyproject.toml` now matches the release. It still read 0.1.0 when 0.1.1 was tagged.
+
+## [0.1.1] - 2026-11-10
+
+### Fixed
+
+- Review diffs no longer depend on the user's git diff configuration. With `diff.noprefix` or
+  `diff.mnemonicPrefix` set, reviewers got an empty diff while the run still succeeded, and
+  `diff.external` aborted the review.
+- Snapshots no longer follow a tracked directory that the working tree replaced with a link to
+  a directory outside the checkout. Before this fix, the outside files went to the reviewer's provider.
+- `question` and `answer` exit with code 4 as documented when no run directory exists yet, or
+  when the latest run directory was removed. They used to print a traceback and exit 1.
+- Free-tier daily limits are checked and recorded under the free-tier lock. Before this fix,
+  concurrent runs could use a throttled model again and lose each other's entries in `limits.json`.
+- An invalid `--expect` regex is reported as a usage error with exit 2, not as a traceback.
+- The coding sandbox sets CPU affinity and niceness without a `preexec_fn`. With the proxy and
+  mailbox threads running, the `preexec_fn` could deadlock the launch.
+
+### Security
+
+- Agent audit logs (`audit.jsonl`) count as secret-like files. They are refused in snapshots,
+  diffs and `--include`.
+
+### Added
+
+- CI runs lint, ShellCheck and the test suite.
+
+## [0.1.0] - 2026-11-07
+
+### Added
+
+- First release. Other agent CLIs (Codex, Claude Code, opencode, Amp) run as confined reviewers
+  of a plan or change, or as coding agents sandboxed with bubblewrap on a git worktree. Pinned
+  CLIs are installed when missing.
+- MIT license.
+
+[0.1.2]: https://github.com/nappa85/external-agents/compare/v0.1.1...v0.1.2
+[0.1.1]: https://github.com/nappa85/external-agents/compare/v0.1.0...v0.1.1
+[0.1.0]: https://github.com/nappa85/external-agents/releases/tag/v0.1.0
