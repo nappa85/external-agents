@@ -131,11 +131,13 @@ ANSI = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 
 
 def run_with_timeouts(
-    command: list[str], cwd: Path, total: float, idle: float | None, env: dict[str, str]
+    command: list[str], cwd: Path, total: float, idle: float | None, env: dict[str, str], log: Path | None = None
 ) -> tuple[int, str]:
     """Kill the run if it exceeds `total` seconds or, when `idle` is set, is silent that long.
 
-    Returns the exit code (124 on a timeout) and the combined output without ANSI escapes."""
+    Returns the exit code (124 on a timeout) and the combined output without ANSI escapes.
+    The raw output is also appended to `log` as it arrives, so a run that is killed
+    leaves a record of what it was doing."""
     # A new session lets a timeout kill the CLI's child processes too, which would
     # otherwise keep the pipe open.
     proc = subprocess.Popen(
@@ -148,11 +150,18 @@ def run_with_timeouts(
         start_new_session=True,
     )
     assert proc.stdout is not None
+    sink = open(log, "ab") if log is not None else None  # noqa: SIM115 - closed in finally
     fd = proc.stdout.fileno()
     chunks: list[bytes] = []
     start = last = time.monotonic()
     selector = selectors.DefaultSelector()
     selector.register(fd, selectors.EVENT_READ)
+
+    def keep(chunk: bytes) -> None:
+        chunks.append(chunk)
+        if sink is not None:
+            sink.write(chunk)
+            sink.flush()
 
     def text() -> str:
         return ANSI.sub("", b"".join(chunks).decode(errors="replace"))
@@ -165,7 +174,8 @@ def run_with_timeouts(
             if now - start > total or idle_expired:
                 proc.kill()
                 proc.wait()
-                return 124, text() + f"\n[killed: {'idle' if idle_expired else 'total'} timeout]"
+                keep(f"\n[killed: {'idle' if idle_expired else 'total'} timeout]".encode())
+                return 124, text()
             if closed:
                 # The CLI closed its output but may keep running; the deadlines still apply.
                 with contextlib.suppress(subprocess.TimeoutExpired):
@@ -180,7 +190,7 @@ def run_with_timeouts(
                     closed = True
                     selector.unregister(fd)
                     continue
-                chunks.append(chunk)
+                keep(chunk)
                 last = time.monotonic()
             elif proc.poll() is not None:
                 # The CLI exited; a lingering descendant may still hold the pipe open.
@@ -188,10 +198,12 @@ def run_with_timeouts(
                     chunk = os.read(fd, 65536)
                     if not chunk:
                         break
-                    chunks.append(chunk)
+                    keep(chunk)
                 break
         return proc.wait(), text()
     finally:
         with contextlib.suppress(ProcessLookupError):
             os.killpg(proc.pid, signal.SIGKILL)
         proc.stdout.close()
+        if sink is not None:
+            sink.close()

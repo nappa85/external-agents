@@ -139,8 +139,17 @@ and has an error line naming a provider failure, such as `Error: rate limit reac
 a review that merely discusses authorization or quotas is kept.
 
 `--idle-timeout` (default 300 s) kills a reviewer that prints nothing that long; it does
-not apply to `claude` and `amp`, which print only at the end. `--timeout` (default
-1800 s) bounds every run.
+not apply to `claude`, which prints only at the end. `amp` runs with `--stream-json`, so
+it prints an event per model turn and tool call, and a model request that hangs without
+failing trips the idle timeout instead of running into the total one. A paid reviewer
+killed that way is retried once from a fresh snapshot; a free one is not. `--timeout`
+(default 1800 s) bounds every run.
+
+Each slot's raw output, preflight included, is appended to `review-<n>.log` (next to
+`--output`, as `<name>.log`) as it arrives, so a running or killed reviewer shows what it
+was doing. For `amp`, each JSON event carries `session_id`, the reviewer's Amp thread,
+which shows the whole run. When no reviewer succeeds, the slot's file keeps the end of
+each failed run: for `amp`, its last tool calls and its thread ID.
 
 Models whose ID ends in `-free` are treated as free tiers: they have daily limits and
 are throttled when runs overlap, often by opening a stream that never returns a byte.
