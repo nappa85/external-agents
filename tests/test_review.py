@@ -546,7 +546,47 @@ class FreeTierAndCompletenessTests(Sandbox):
 
     def test_a_silent_run_killed_for_idleness_is_stalled(self) -> None:
         self.assertEqual(review.classify(124, "partial\n[killed: idle timeout]"), "stalled")
-        self.assertEqual(review.classify(124, "partial\n[killed: total timeout]"), "unavailable")
+        self.assertEqual(review.classify(124, "partial\n[killed: total timeout]"), "timed out")
+
+    def test_a_stalled_amp_reviewer_is_retried_once_and_its_trace_kept(self) -> None:
+        # `amp --stream-json` events; the run stalls after its first tool call while the
+        # counter file holds a positive number.
+        events = {
+            "start": [
+                {"type": "system", "subtype": "init", "session_id": "T-1"},
+                {"type": "assistant", "session_id": "T-1", "message": {"content": [
+                    {"type": "tool_use", "name": "Read", "input": {"path": "REVIEW_DIFF.patch"}}
+                ]}},
+            ],
+            "end": [{"type": "result", "is_error": False, "result": "Findings.\nVERDICT: approve", "session_id": "T-1"}],
+        }  # fmt: skip
+        for name, lines in events.items():
+            (self.root / name).write_text("".join(json.dumps(line) + "\n" for line in lines))
+        counter = self.root / "stalls"
+        self.fake(
+            "amp",
+            f"echo 'Warning: deprecated' >&2\ncat {self.root / 'start'}\nn=$(cat {counter})\n"
+            f'if [ "$n" -gt 0 ]; then echo $((n - 1)) > {counter}; sleep 30; fi\ncat {self.root / "end"}',
+        )
+
+        counter.write_text("1\n")
+        retried = self.panel("amp:p/model")
+
+        self.assertEqual(retried.returncode, 0, retried.stderr)
+        self.assertIn("amp:p/model: stalled (exit 124); retrying once.", retried.stderr)
+        self.assertEqual(self.output.read_text(), "reviewer: amp:p/model\nFindings.\nVERDICT: approve")
+
+        counter.write_text("2\n")
+        failed = self.panel("amp:p/model")
+
+        self.assertEqual(failed.returncode, 3, failed.stderr)
+        self.assertEqual(
+            self.output.read_text(),
+            "no reviewer available:\namp:p/model: stalled (exit 124)\n  Warning: deprecated\n"
+            '  tool Read {"path": "REVIEW_DIFF.patch"}\n  amp thread: T-1\n  [killed: idle timeout]\n',
+        )
+        log = self.output.with_suffix(".log").read_text()
+        self.assertEqual(log.count("[killed: idle timeout]"), 2, log)
 
 
 class PatchFilterTests(unittest.TestCase):

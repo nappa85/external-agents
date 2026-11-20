@@ -4,6 +4,27 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- An `amp` reviewer whose model request hangs without failing is now caught by `--idle-timeout`
+  instead of running into the 1800 s total timeout. `amp` now runs with `--stream-json`, so it
+  prints an event for each model turn and tool call. A paid reviewer that stalls is retried once
+  from a fresh snapshot; free tiers are still not retried.
+
+### Added
+
+- Each slot's raw reviewer output, preflight included, is written to `review-<n>.log` as it
+  arrives, so a running or killed reviewer shows what it was doing. When no reviewer succeeds,
+  the slot's file shows an `amp` reviewer's last tool calls and its Amp thread ID.
+
+### Changed
+
+- A reviewer killed at the total timeout is reported as `timed out` instead of `unavailable`.
+- `amp` reviews no longer start with the CLI's deprecation warning: the review comes from the
+  final stream event.
+
 ## [0.1.2] - 2026-11-18
 
 ### Added

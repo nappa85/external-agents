@@ -74,7 +74,8 @@ python3 -I <skill-dir>/scripts/external_agents.py review \
   --prompt-file "$PROMPT" --output-dir "$OUT_DIR" --base main
 ```
 
-Each slot writes `review-<n>.md`, whose first line names the reviewer. A reviewer that
+Each slot writes `review-<n>.md`, whose first line names the reviewer, and
+`review-<n>.log`, the raw output of its runs as they happen. A reviewer that
 wrote files, such as a regression test for a finding, leaves `review-<n>.patch`: read
 it in full before applying it, and never apply or run it automatically.
 

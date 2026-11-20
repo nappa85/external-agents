@@ -137,8 +137,8 @@ class Reviewer:
 
     @property
     def idle_timeout_applies(self) -> bool:
-        # `claude -p` and `amp -x` print nothing until the review is complete.
-        return self.backend not in ("claude", "amp")
+        # `claude -p` prints nothing until the review is complete; `amp` streams JSON events.
+        return self.backend != "claude"
 
     @property
     def free(self) -> bool:
@@ -168,8 +168,11 @@ class Reviewer:
             ]  # fmt: skip
         if self.backend == "amp":
             return [
+                # Streamed events show progress, so a stalled model request trips the idle
+                # timeout, and a killed run's log shows what it was doing.
                 "amp", "--settings-file", str(snap / AMP_SETTINGS), "--mode", AMP_MODE,
-                "--visibility", "private", "--no-notifications", "--no-ide", "-x", instruction,
+                "--visibility", "private", "--no-notifications", "--no-ide", "--stream-json",
+                "-x", instruction,
             ]  # fmt: skip
         # opencode calls an effort a variant.
         effort = ["--variant", self.effort] if self.effort else []
@@ -256,11 +259,14 @@ def resolve_panel(cli: list[str] | None, cli_panel: str | None, env: str | None)
 
 
 def classify(returncode: int, output: str, expect: re.Pattern[str] | None = None) -> str:
-    """`ok`, `stalled` (killed after going silent), `unavailable`, or `incomplete` (exited 0
-    but without the text `expect` requires, such as a verdict line)."""
+    """`ok`, `stalled` (killed after going silent), `timed out` (killed at the total
+    timeout), `unavailable`, or `incomplete` (exited 0 but without the text `expect`
+    requires, such as a verdict line)."""
     text = output.strip()
     if returncode == 124 and text.endswith("[killed: idle timeout]"):
         return "stalled"
+    if returncode == 124 and text.endswith("[killed: total timeout]"):
+        return "timed out"
     if returncode != 0 or not text:
         return "unavailable"
     # Some CLIs exit 0 after printing a provider error. Only a short output with an error
@@ -318,8 +324,53 @@ def mark_limited(reviewer: Reviewer, reason: str) -> None:
     (state_dir() / "limits.json").write_text(json.dumps(ledger, indent=2))
 
 
-def attempt(reviewer: Reviewer, pristine: Path, instruction: str, total: float, idle: float) -> tuple[int, str, bytes]:
-    """Run one reviewer on a fresh copy of `pristine`.
+def amp_output(code: int, raw: str) -> str:
+    """The review from `amp --stream-json` output, or a readable trace of the run.
+
+    A successful run yields its final message. Otherwise each event becomes a short line,
+    so the failure tail shows the last tool calls, the Amp thread to open, and why the run
+    ended; text that is not an event, such as a CLI warning or the kill marker, is kept.
+    Output without any event, such as a startup failure, is returned unchanged."""
+    lines: list[str] = []
+    thread = None
+    events = 0
+    for line in raw.splitlines():
+        try:
+            event = json.loads(line)
+        except ValueError:
+            event = None
+        if not isinstance(event, dict):
+            if line.strip():
+                lines.append(line)
+            continue
+        events += 1
+        thread = event.get("session_id") or thread
+        if event.get("type") == "result":
+            result = str(event.get("result") or event.get("error") or "")
+            if code == 0 and not event.get("is_error") and result.strip():
+                return result
+            lines.append(f"Error: {result}" if event.get("is_error") else f"result: {result[:500]}")
+            continue
+        if event.get("type") != "assistant":
+            continue
+        for block in event.get("message", {}).get("content", []):
+            if block.get("type") == "tool_use":
+                lines.append(f"tool {block.get('name')} {json.dumps(block.get('input'))[:200]}")
+            elif block.get("type") == "text":
+                lines.append(f"text: {' '.join(str(block.get('text')).split())[:200]}")
+    if not events:
+        return raw
+    if thread:
+        # Before the kill marker, which `classify` reads at the end.
+        marker = lines.pop() if lines and lines[-1].startswith("[killed:") else None
+        lines += [f"amp thread: {thread}", *([marker] if marker else [])]
+    return "\n".join(lines)
+
+
+def attempt(
+    reviewer: Reviewer, pristine: Path, instruction: str, total: float, idle: float, log: Path
+) -> tuple[int, str, bytes]:
+    """Run one reviewer on a fresh copy of `pristine`, appending its raw output to `log`.
 
     Returns its exit code, its output, and a Git patch of the files it changed."""
     snap = pristine.parent / "snapshot"
@@ -329,6 +380,8 @@ def attempt(reviewer: Reviewer, pristine: Path, instruction: str, total: float, 
     # The recording repository sits next to the snapshot, outside the reviewer's reach.
     changes = Changes(pristine.parent / "changes.git", snap, (*HANDOFF_FILES, *reviewer.owned_paths))
     before = changes.tree()
+    with log.open("a") as header:
+        header.write(f"\n=== {reviewer.label} at {dt.datetime.now().astimezone():%H:%M:%S %Z}: {instruction[:60]}\n")
     with tempfile.TemporaryDirectory(prefix="xagents-msg-") as tmp:
         last_message = Path(tmp) / "last-message.md"
         code, output = run_with_timeouts(
@@ -337,7 +390,10 @@ def attempt(reviewer: Reviewer, pristine: Path, instruction: str, total: float, 
             total,
             idle if reviewer.idle_timeout_applies else None,
             agent_env(snap, reviewer.backend),
+            log,
         )
+        if reviewer.backend == "amp":
+            output = amp_output(code, output)
         if code == 0 and last_message.is_file() and last_message.read_text().strip():
             output = last_message.read_text()
     try:
@@ -347,10 +403,10 @@ def attempt(reviewer: Reviewer, pristine: Path, instruction: str, total: float, 
         return code, f"{output.rstrip()}\n\nThe wrapper could not record the reviewer's file changes: {error}\n", b""
 
 
-def preflight(reviewer: Reviewer, pristine: Path, timeout: float = 90, attempts: int = 2) -> bool:
+def preflight(reviewer: Reviewer, pristine: Path, log: Path, timeout: float = 90, attempts: int = 2) -> bool:
     """A short call that catches missing auth or exhausted quota, which can otherwise hang."""
     for number in range(1, attempts + 1):
-        code, output, _ = attempt(reviewer, pristine, "Reply with exactly: PONG", timeout, timeout)
+        code, output, _ = attempt(reviewer, pristine, "Reply with exactly: PONG", timeout, timeout, log)
         if code == 0 and "PONG" in output:
             return True
         tail = " ".join(output.split())[-300:]
@@ -369,7 +425,7 @@ class Options:
 
 
 def review_with_fallback(
-    reviewers: list[Reviewer], pristine: Path, options: Options
+    reviewers: list[Reviewer], pristine: Path, options: Options, run_log: Path
 ) -> tuple[Reviewer | None, str, bytes]:
     """The first reviewer that produces a review, its output, and its file changes.
 
@@ -384,11 +440,17 @@ def review_with_fallback(
                 log.append(f"{reviewer.label}: skipped (limited earlier today)")
                 print(f"{reviewer.label}: limited earlier today; trying the next reviewer.", file=sys.stderr)
                 continue
-            if options.preflight and not preflight(reviewer, pristine):
+            if options.preflight and not preflight(reviewer, pristine, run_log):
                 log.append(f"{reviewer.label}: preflight failed")
                 continue
-            code, output, changes = attempt(reviewer, pristine, INSTRUCTION, options.total, options.idle)
+            code, output, changes = attempt(reviewer, pristine, INSTRUCTION, options.total, options.idle, run_log)
             state = classify(code, output, options.expect)
+            if state == "stalled" and not reviewer.free:
+                # A paid model's request can hang without failing; a fresh run usually
+                # completes. Free tiers stall from throttling, so they are not retried.
+                print(f"{reviewer.label}: stalled (exit {code}); retrying once.", file=sys.stderr)
+                code, output, changes = attempt(reviewer, pristine, INSTRUCTION, options.total, options.idle, run_log)
+                state = classify(code, output, options.expect)
             if reviewer.free and state in ("stalled", "unavailable"):
                 # Free tiers rarely say "limit": a stall or a failure stops spending runs on
                 # the model for the day.
@@ -410,12 +472,12 @@ def review_with_fallback(
 
 
 def review_slot(
-    slot: Slot, args: argparse.Namespace, source: Path, files: dict[str, str]
+    slot: Slot, args: argparse.Namespace, source: Path, files: dict[str, str], run_log: Path
 ) -> tuple[Reviewer | None, str, bytes]:
     """Run one slot on its own snapshots, since backends and reviewers write into them.
 
     Every attempt starts from the same pristine copy, so a failed reviewer's changes do
-    not reach the next one."""
+    not reach the next one. Every run's raw output goes to `run_log` as it arrives."""
     if not slot.reviewers:
         return None, "no backend is installed or configured", b""
     options = Options(args.timeout, args.idle_timeout, not args.no_preflight, args.expect)
@@ -424,13 +486,13 @@ def review_slot(
         snapshot(source, pristine, args.include)
         for name, content in files.items():
             write_generated(pristine / name, content)
-        return review_with_fallback(list(slot.reviewers), pristine, options)
+        return review_with_fallback(list(slot.reviewers), pristine, options, run_log)
 
 
 def output_paths(args: argparse.Namespace, count: int) -> list[Path]:
     if args.output is not None:
-        if args.output.suffix == ".patch":
-            raise UsageError("--output must not end in .patch; the reviewer's changes are written there")
+        if args.output.suffix in (".patch", ".log"):
+            raise UsageError(f"--output must not end in {args.output.suffix}; the wrapper writes that file")
         if count != 1:
             raise UsageError(f"the panel has {count} slots; pass --output-dir instead of --output")
         return [args.output]
@@ -467,8 +529,12 @@ def review(args: argparse.Namespace) -> int:
     patch = base_diff(source, args.base) if args.base else args.diff_file.read_text() if args.diff_file else None
     if patch is not None:
         files[DIFF_FILE], files[FILES_FILE] = filter_patch(patch)
+    logs = [path.with_suffix(".log") for path in paths]
+    for log in logs:
+        log.write_text("")
+    print(f"raw reviewer output, written as it arrives: {', '.join(map(str, logs))}", file=sys.stderr)
     with ThreadPoolExecutor(max_workers=len(panel)) as pool:
-        results = list(pool.map(lambda slot: review_slot(slot, args, source, files), panel))
+        results = list(pool.map(lambda slot, log: review_slot(slot, args, source, files, log), panel, logs))
     complete = True
     for number, (slot, path, (reviewer, output, changes)) in enumerate(
         zip(panel, paths, results, strict=True), start=1
