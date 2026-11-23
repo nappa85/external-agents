@@ -202,6 +202,16 @@ def bind_executable(command: str, mounts: Mounts) -> str:
     if found is None:
         fail(f"{command} is not installed")
     real = os.path.realpath(found)
+    venv = Path(real).parent.parent
+    if (venv / "pyvenv.cfg").is_file():
+        # A Python CLI in its own virtual environment, such as a `uv tool` or pipx
+        # install: the environment and the interpreter it was created from. Its launcher
+        # may start other programs from the environment, such as Vibe's bundled binary.
+        mounts.add_ro(check_bind(str(venv)))
+        interpreter = os.path.realpath(venv / "bin" / "python")
+        if not is_system(interpreter):
+            mounts.add_ro(check_bind(os.path.dirname(os.path.dirname(interpreter))))
+        return real
     for path in npm_closure(package_root(real)) if "/node_modules/" in real else [real]:
         mounts.add_ro(path)
     with open(real, "rb") as file:

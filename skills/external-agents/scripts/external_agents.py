@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""Use other agent CLIs (Codex, Claude Code, opencode, Amp) as confined reviewers or as
-sandboxed coding agents.
+"""Use other agent CLIs (Codex, Claude Code, opencode, Amp, Mistral Vibe) as confined
+reviewers or as sandboxed coding agents.
 
   detect                       what is configured, installed, and missing
   install [targets]            install pinned CLIs and bubblewrap (default: what is configured)

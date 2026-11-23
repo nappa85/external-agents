@@ -4,6 +4,24 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.4] - 2026-11-23
+
+### Added
+
+- A `vibe` backend for [Mistral Vibe](https://github.com/mistralai/mistral-vibe), as a
+  reviewer and as a coding agent, with `install vibe` pinning 3.1.4 through `uv`. A
+  reviewer runs the `accept-edits` policy with `outside_workdir = "deny"` and shell, web
+  and subagent tools refused, set through `VIBE_*` variables that override the user's
+  config; the repository's `.vibe/` is removed from the snapshot. `@effort` becomes
+  `--thinking`.
+- The coding sandbox can run a CLI installed in its own Python virtual environment, such
+  as a `uv tool` or pipx install.
+
+### Changed
+
+- `MISTRAL_*` variables are passed to agents with the other provider credentials, so
+  `MISTRAL_API_KEY` no longer needs `EXTERNAL_AGENTS_ENV_PASSTHROUGH`.
+
 ## [0.1.3] - 2026-11-20
 
 ### Fixed

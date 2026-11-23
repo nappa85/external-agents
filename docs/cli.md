@@ -21,7 +21,7 @@ python3 -I skills/external-agents/scripts/external_agents.py <command> [options]
 Agents otherwise receive only basic variables (`PATH`, `HOME`, locale, proxy, CA
 settings) and provider credentials (`OPENAI_*`, `ANTHROPIC_*`, `CLAUDE_*`, `CODEX_*`,
 `OPENCODE_*`, `OPENROUTER_*`, `AWS_*`, `GOOGLE_*`, `GEMINI_*`, `VERTEX_*`, `AZURE_*`,
-and `AMP_*` for amp only).
+`MISTRAL_*`, and `AMP_*` for amp only).
 
 ## Backends and models
 
@@ -33,6 +33,7 @@ An agent is `backend[:model]`:
 | `claude`   | Claude model or alias, such as `sonnet`; default: configured  | no             |
 | `opencode` | `provider/model`, such as `openai/gpt-6.1-sol`                | yes            |
 | `amp`      | reviewer: `provider/model`; coder: an Amp mode key            | reviewer only  |
+| `vibe`     | a model alias from Vibe's config, such as `mistral-medium-3.5` | no             |
 
 ## Panel syntax
 
@@ -52,6 +53,7 @@ pass the effort on and the provider rejects one the model does not support.
 | `claude`   | `--effort`                         |
 | `opencode` | `--variant`                        |
 | `amp`      | generated agent `reasoningEffort` |
+| `vibe`     | `--thinking` (`none` as `off`)     |
 
 A suffix that is not one of these efforts stays part of the model ID, so a model such
 as `claude-sonnet-4@20250514` is unaffected.
@@ -68,7 +70,7 @@ that installs each).
 
 ## `install [targets...] [--best-effort]`
 
-Targets: `claude`, `codex`, `opencode`, `amp`, `bubblewrap`, `all`. Without targets,
+Targets: `claude`, `codex`, `opencode`, `amp`, `vibe`, `bubblewrap`, `all`. Without targets,
 installs the backends the configuration names, plus bubblewrap when `EXTERNAL_CODER` is
 set. Exit 2 when an install fails, unless `--best-effort`.
 
@@ -78,6 +80,7 @@ set. Exit 2 when an install fails, unless `--best-effort`.
 | `claude`     | `npm install -g @anthropic-ai/claude-code@<pin>`                           |
 | `codex`      | `npm install -g @openai/codex@<pin>`                                       |
 | `amp`        | `npm install -g @sourcegraph/amp@<pin>`                                    |
+| `vibe`       | `uv tool install --python 3.14 mistral-vibe==<pin>`                        |
 | `bubblewrap` | apt, dnf, zypper, pacman, apk, or emerge; then a namespace check           |
 
 ## `review`
@@ -96,7 +99,7 @@ Runs the panel on a snapshot of a Git checkout.
 | `--reviewer AGENT`        | override with one slot; repeat for fallbacks                                    |
 | `--expect REGEX`          | a review must match, or it counts as incomplete and the next reviewer runs      |
 | `--timeout S`             | per-attempt limit (default 1800)                                                |
-| `--idle-timeout S`        | kill after S seconds of silence (default 300; not for `claude`, `amp`)          |
+| `--idle-timeout S`        | kill after S seconds of silence (default 300; not for `claude`)                 |
 | `--no-preflight`          | skip the "Reply with exactly: PONG" check before each reviewer                  |
 
 The snapshot also holds `REVIEW_FILES.txt`, the changed paths with a status letter

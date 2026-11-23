@@ -17,7 +17,7 @@ python3 -I <skill-dir>/scripts/external_agents.py install codex claude # named t
 python3 -I <skill-dir>/scripts/external_agents.py install all --best-effort
 ```
 
-Targets are `codex`, `claude`, `opencode`, `amp`, `bubblewrap`, or `all`. Without
+Targets are `codex`, `claude`, `opencode`, `amp`, `vibe`, `bubblewrap`, or `all`. Without
 targets, it installs the backends that `EXTERNAL_REVIEWERS` and `EXTERNAL_CODER` name,
 plus bubblewrap when a coder is configured. Every script is idempotent.
 
@@ -27,6 +27,7 @@ plus bubblewrap when a coder is configured. Every script is idempotent.
 | `claude`     | `npm install -g @anthropic-ai/claude-code@<pinned>`                                           |
 | `codex`      | `npm install -g @openai/codex@<pinned>`                                                       |
 | `amp`        | `npm install -g @sourcegraph/amp@<pinned>`                                                    |
+| `vibe`       | `uv tool install --python 3.14 mistral-vibe==<pinned>` from PyPI; no remote script            |
 | `bubblewrap` | the system package manager (apt, dnf, zypper, pacman, apk, emerge), then a namespace check    |
 
 npm verifies packages against the registry's integrity hashes. An installed CLI of
@@ -35,8 +36,8 @@ version, as a reproducible environment should. To upgrade a pin, edit the versio
 for opencode the checksums) at the top of its script in `scripts/install/`.
 
 Installers never log in. Each prints what is missing: `opencode auth login`,
-`claude setup-token` then `CLAUDE_CODE_OAUTH_TOKEN`, `codex login`, `amp login`, or a
-provider API key variable.
+`claude setup-token` then `CLAUDE_CODE_OAUTH_TOKEN`, `codex login`, `amp login`,
+`MISTRAL_API_KEY` (exported or in `~/.vibe/.env`) for Vibe, or a provider API key variable.
 
 ## Environments
 
@@ -65,7 +66,7 @@ failed install fail the environment:
 
 ```bash
 EXTERNAL_AGENTS_PIN=1 python3 -I .agents/skills/external-agents/scripts/external_agents.py \
-  install codex claude opencode amp --best-effort
+  install codex claude opencode amp vibe --best-effort
 ```
 
 Each person then sets `EXTERNAL_REVIEWERS` and credentials as personal secrets. An
@@ -79,5 +80,6 @@ secrets. Only send source to providers your organization's agreement covers.
 
 - Python 3.11 or later, standard library only, and git.
 - Node.js 18 or later with npm for the `claude`, `codex`, and `amp` installers.
+- uv for the `vibe` installer; it fetches Python 3.14 when needed.
 - `curl`, `tar` or `unzip`, and `sha256sum` or `shasum` for the opencode installer.
 - For coding agents: Linux, bubblewrap, and unprivileged user namespaces.

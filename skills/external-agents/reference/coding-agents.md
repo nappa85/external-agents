@@ -21,14 +21,16 @@ permission prompts off.
   package brings its package directory and its installed dependencies, including the
   optional platform package where Codex keeps its native binary. A Node.js launcher also
   brings the Node installation that `node` on your PATH resolves to, through shims such
-  as mise.
+  as mise. A CLI in its own Python virtual environment, as `uv tool install` leaves
+  Vibe, brings the environment and the interpreter it was created from.
 - **Login.** The backend's login file is bound read-only at the same place in the
   fresh HOME: `~/.local/share/opencode/auth.json`, `~/.claude/.credentials.json`,
-  `~/.codex/auth.json`, or `~/.local/share/amp/secrets.json`. Provider credential
-  variables (`OPENAI_*`, `ANTHROPIC_*`, ...; `AMP_*` for amp) and the
+  `~/.codex/auth.json`, `~/.local/share/amp/secrets.json`, or `~/.vibe/.env`. Provider
+  credential variables (`OPENAI_*`, `ANTHROPIC_*`, `MISTRAL_*`, ...; `AMP_*` for amp) and the
   `EXTERNAL_AGENTS_ENV_PASSTHROUGH` names are passed too; every other variable is
   dropped. Because the login is read-only, a token refresh inside the sandbox is not
-  saved: refresh your login on the host before a long run.
+  saved: refresh your login on the host before a long run. The system keyring is out of
+  reach, so a Vibe key kept only there must be exported as `MISTRAL_API_KEY`.
 
 ## Network
 
@@ -46,11 +48,12 @@ Default egress by backend:
 | `claude`   | api.anthropic.com, console.anthropic.com, platform.claude.com                                |
 | `codex`    | chatgpt.com, auth.openai.com, api.openai.com                                                 |
 | `amp`      | ampcode.com                                                                                  |
+| `vibe`     | api.mistral.ai                                                                               |
 
 `--allow-host` adds a host, `--hosts a,b` replaces the list, and `--log-hosts` prints
 every `CONNECT` the agent makes, which is how to find a missing host. Refusals are
 always logged. opencode asks for `models.opencode.ai` and `registry.npmjs.org` at
-start; they are refused and it works without them.
+start, and Vibe for `chat.mistral.ai`; they are refused and both work without them.
 
 Package registries are unreachable, so dependencies must already be on the machine.
 
@@ -113,6 +116,7 @@ The agent's output goes to the launcher's stdout and stderr; redirect it to a lo
 | `claude`   | `claude -p --dangerously-skip-permissions`, `IS_SANDBOX=1`          | starts in the sandbox; model call not yet verified |
 | `codex`    | `codex exec --dangerously-bypass-approvals-and-sandbox`             | starts in the sandbox; model call not yet verified |
 | `amp`      | `amp --dangerously-allow-all -x`; the model part names a mode       | starts in the sandbox; model call not yet verified |
+| `vibe`     | `vibe --prompt=<task> --auto-approve`; the model part is an alias   | reaches api.mistral.ai; not yet verified with a valid key |
 
 `-- <backend> --version` checks that an agent starts in the sandbox without calling a
 model: a check command still gets the configured agent, its login, and its variables.

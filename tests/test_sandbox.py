@@ -232,6 +232,36 @@ class Binding(unittest.TestCase):
             self.assertEqual(mounts.ro, [str(package.resolve()), "/opt/node"])
             self.assertEqual(mounts.path, ["/opt/node/bin"])
 
+    def test_a_cli_in_a_python_venv_brings_the_venv_and_its_interpreter(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            base = root / "python/cpython-3.14"
+            (base / "bin").mkdir(parents=True)
+            (base / "bin/python3.14").touch()
+            venv = root / "tools/mistral-vibe"
+            (venv / "bin").mkdir(parents=True)
+            (venv / "pyvenv.cfg").write_text(f"home = {base}/bin\n")
+            (venv / "bin/python").symlink_to(base / "bin/python3.14")
+            launcher = venv / "bin/vibe"
+            launcher.write_text("#!/bin/sh\n")
+            launcher.chmod(0o755)
+            (root / "bin").mkdir()
+            (root / "bin/vibe").symlink_to(launcher)
+            mounts = sandbox.Mounts()
+            with mock.patch.dict(os.environ, {"PATH": f"{root}/bin:{os.environ['PATH']}"}):
+                real = sandbox.bind_executable("vibe", mounts)
+            self.assertEqual(real, str(launcher))
+            self.assertEqual(mounts.ro, [str(venv), str(base)])
+
+    def test_vibe_coder_takes_the_task_as_one_argument_and_reaches_only_mistral(self) -> None:
+        command = backends.coder_command("vibe", "/v/bin/vibe", "mistral-medium-3.5", Path("/wt"), "-x task")
+        self.assertEqual(
+            command,
+            ["/v/bin/vibe", "--prompt=-x task", "--workdir", "/wt", "--auto-approve", "--model", "mistral-medium-3.5"],
+        )
+        self.assertEqual(backends.coder_hosts("vibe", None), ("api.mistral.ai",))
+        self.assertEqual(backends.coder_env("vibe")["VIBE_ENABLE_TELEMETRY"], "false")
+
     def test_a_bind_that_would_expose_the_home_is_refused(self) -> None:
         for path in ("/", str(Path.home())):
             with self.assertRaisesRegex(common.UsageError, "contains the home"):

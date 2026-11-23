@@ -7,7 +7,7 @@ from pathlib import Path
 
 from .common import SCRIPTS_DIR, UsageError
 
-BACKENDS = ("codex", "claude", "opencode", "amp")
+BACKENDS = ("codex", "claude", "opencode", "amp", "vibe")
 # Backends that need an explicit model: opencode serves many providers and may default to a
 # free tier; an amp reviewer runs a generated agent that names its model. A coding amp
 # agent takes an optional mode key instead.
@@ -19,6 +19,7 @@ INSTALLERS = {
     "codex": SCRIPTS_DIR / "install" / "codex.sh",
     "opencode": SCRIPTS_DIR / "install" / "opencode.sh",
     "amp": SCRIPTS_DIR / "install" / "amp.sh",
+    "vibe": SCRIPTS_DIR / "install" / "vibe.sh",
     "bubblewrap": SCRIPTS_DIR / "install" / "bubblewrap.sh",
 }
 # Project configuration each backend loads from its working directory and that can run
@@ -29,6 +30,9 @@ PROJECT_CONFIG = {
     "codex": (Path(".codex"),),
     "opencode": (Path(".opencode"), Path("opencode.jsonc")),
     "amp": (AMP_PLUGINS,),
+    # `.vibe/` can hold Python tools, plugins, agents and config; Vibe ignores some of it
+    # in an untrusted folder, but the wrapper does not rely on that.
+    "vibe": (Path(".vibe"),),
 }
 
 
@@ -52,6 +56,7 @@ CODER_HOSTS: dict[str, tuple[str, ...]] = {
     "claude": ("api.anthropic.com", "console.anthropic.com", "platform.claude.com"),
     "codex": OPENAI_HOSTS,
     "amp": ("ampcode.com",),
+    "vibe": ("api.mistral.ai",),
 }
 OPENCODE_PROVIDER_HOSTS: dict[str, tuple[str, ...]] = {
     "openai": OPENAI_HOSTS,
@@ -78,6 +83,9 @@ CODER_CREDENTIALS: dict[str, tuple[str, ...]] = {
     "claude": (".claude/.credentials.json",),
     "codex": (".codex/auth.json",),
     "amp": (".local/share/amp/secrets.json",),
+    # Vibe's plaintext key file. A key kept only in the system keyring is out of reach in
+    # the sandbox; export MISTRAL_API_KEY instead.
+    "vibe": (".vibe/.env",),
 }
 
 # Inside the sandbox the agent may run commands: the sandbox, not the agent's own
@@ -99,6 +107,15 @@ OPENCODE_CODER = {
 }  # fmt: skip
 
 
+# Vibe reads `VIBE_<SETTING>` variables over its user and project config. These turn off
+# what would only reach other hosts or start background work: telemetry, update checks,
+# MCP servers and Mistral connectors.
+VIBE_QUIET = {
+    "VIBE_ENABLE_TELEMETRY": "false", "VIBE_ENABLE_UPDATE_CHECKS": "false", "VIBE_ENABLE_AUTO_UPDATE": "false",
+    "VIBE_ENABLE_MCP": "false", "VIBE_ENABLE_CONNECTORS": "false",
+}  # fmt: skip
+
+
 def coder_files(backend: str) -> dict[str, str]:
     """Configuration files, relative to the sandbox HOME, that the launcher writes."""
     if backend == "opencode":
@@ -112,6 +129,8 @@ def coder_env(backend: str) -> dict[str, str]:
         # The sandbox is the boundary, so permission prompts are skipped; Claude Code asks
         # for IS_SANDBOX to allow that. Telemetry and update checks would only be refused.
         return {"IS_SANDBOX": "1", "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1", "DISABLE_AUTOUPDATER": "1"}
+    if backend == "vibe":
+        return dict(VIBE_QUIET)
     return {}
 
 
@@ -127,6 +146,11 @@ def coder_command(backend: str, executable: str, model: str | None, worktree: Pa
             executable, "exec", "--dangerously-bypass-approvals-and-sandbox", "--skip-git-repo-check",
             "--color", "never", "--cd", str(worktree), *chosen, task,
         ]  # fmt: skip
+    if backend == "vibe":
+        # The model part is an alias from Vibe's model list, such as `mistral-medium-3.5`.
+        # `--prompt=` keeps a task that starts with `-` from being read as an option.
+        chosen = ["--model", model] if model else []
+        return [executable, f"--prompt={task}", "--workdir", str(worktree), "--auto-approve", *chosen]
     # For amp the model part names an agent mode, such as `smart`.
     chosen = ["--mode", model] if model else []
     return [executable, "--dangerously-allow-all", "--no-notifications", "--no-ide", *chosen, "-x", task]

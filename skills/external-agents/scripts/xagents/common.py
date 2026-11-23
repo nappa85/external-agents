@@ -87,7 +87,7 @@ BASE_ENV_PREFIXES = ("LC_", "XDG_")
 # Provider credentials the backends need to authenticate.
 PROVIDER_ENV_PREFIXES = (
     "ANTHROPIC_", "CLAUDE_", "OPENAI_", "CODEX_", "OPENCODE_", "OPENROUTER_",
-    "AWS_", "GOOGLE_", "GEMINI_", "VERTEX_", "AZURE_",
+    "AWS_", "GOOGLE_", "GEMINI_", "VERTEX_", "AZURE_", "MISTRAL_",
 )  # fmt: skip
 # Amp authenticates with its own credentials, so only the amp backend receives them.
 AMP_ENV_PREFIX = "AMP_"

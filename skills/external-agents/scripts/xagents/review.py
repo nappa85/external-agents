@@ -32,6 +32,7 @@ from .backends import (
     INSTALLERS,
     PROJECT_CONFIG,
     REVIEW_MODEL_REQUIRED,
+    VIBE_QUIET,
     parse_agent,
 )
 from .common import ENV_REVIEWERS, UsageError, agent_env, installed, remove, run_with_timeouts, write_generated
@@ -98,6 +99,26 @@ export default function (amp: PluginAPI) {{
 }}
 """
 
+# Vibe reads `VIBE_<SETTING>` variables over the user's and the project's config, so these
+# hold even when `~/.vibe/config.toml` allows more. With the `accept-edits` policy only
+# file edits run without approval, and a headless run denies anything that needs it.
+# `outside_workdir` denies file tools outside the snapshot, through symlinks too. Shell,
+# web and subagent tools are refused outright, and the JavaScript tool `run_typescript`
+# loses its process and subagent APIs; what it can still call goes through the same checks.
+VIBE_REVIEWER_ENV = {
+    **VIBE_QUIET,
+    "VIBE_OUTSIDE_WORKDIR": "deny",
+    "VIBE_BYPASS_TOOL_PERMISSIONS": "false",
+    "VIBE_ENABLE_AUTO_APPROVE": "false",
+    "VIBE_ENABLE_SUBAGENTS": "false",
+    "VIBE_ENABLE_BACKGROUND_PROCESSES": "false",
+    "VIBE_SESSION_LOGGING__ENABLED": "false",
+    "VIBE_TOOLS": json.dumps({
+        tool: {"permission": "never"}
+        for tool in ("bash", "git_bash", "powershell", "web_fetch", "web_search", "task")
+    }),
+}  # fmt: skip
+
 
 def snapshot_roots(snap: Path) -> list[str]:
     """Both spellings of the snapshot path: a temporary directory can sit behind a symlink,
@@ -137,7 +158,8 @@ class Reviewer:
 
     @property
     def idle_timeout_applies(self) -> bool:
-        # `claude -p` prints nothing until the review is complete; `amp` streams JSON events.
+        # `claude -p` prints nothing until the review is complete; `amp` and `vibe` stream
+        # JSON events.
         return self.backend != "claude"
 
     @property
@@ -174,12 +196,24 @@ class Reviewer:
                 "--visibility", "private", "--no-notifications", "--no-ide", "--stream-json",
                 "-x", instruction,
             ]  # fmt: skip
+        if self.backend == "vibe":
+            # Vibe calls an effort a thinking level, and "no reasoning" `off`.
+            thinking = ["--thinking", "off" if self.effort == "none" else self.effort] if self.effort else []
+            return [
+                # Not `--trust`: an untrusted folder's project config is ignored.
+                "vibe", f"--prompt={instruction}", "--workdir", str(snap), "--agent", "default",
+                "--approval-policy", "accept-edits", "--output", "streaming", *model, *thinking,
+            ]  # fmt: skip
         # opencode calls an effort a variant.
         effort = ["--variant", self.effort] if self.effort else []
         # opencode takes its project from `$PWD`, not the process cwd; pin it with --dir.
         return [
             "opencode", "run", "--dir", str(snap), "-m", str(self.model), "--agent", "reviewer", *effort, instruction,
         ]  # fmt: skip
+
+    def env(self, snap: Path) -> dict[str, str]:
+        extra = VIBE_REVIEWER_ENV if self.backend == "vibe" else {}
+        return agent_env(snap, self.backend) | extra
 
     @property
     def owned_paths(self) -> tuple[Path, ...]:
@@ -367,6 +401,39 @@ def amp_output(code: int, raw: str) -> str:
     return "\n".join(lines)
 
 
+def vibe_output(code: int, raw: str) -> str:
+    """The review from `vibe --output streaming`, or a readable trace of the run.
+
+    Each line is a finished history entry. A successful run yields its last assistant
+    message; otherwise tool calls become short lines and other text, such as a denied
+    call, an `Error:` line or the kill marker, is kept."""
+    lines: list[str] = []
+    answer = None
+    events = 0
+    for line in raw.splitlines():
+        try:
+            entry = json.loads(line)
+        except ValueError:
+            entry = None
+        if not isinstance(entry, dict):
+            if line.strip():
+                lines.append(line)
+            continue
+        events += 1
+        if entry.get("type") == "message" and entry.get("role") == "assistant":
+            content = entry.get("content") or []
+            text = "\n\n".join(str(b.get("text")) for b in content if isinstance(b, dict) and b.get("type") == "text")
+            if text.strip():
+                answer = text
+                lines.append(f"text: {' '.join(text.split())[:200]}")
+        elif entry.get("type") == "effect":
+            display = (entry.get("detail") or {}).get("display") or {}
+            lines.append(f"tool {entry.get('title')}: {' '.join(str(display.get('summary', '')).split())[:200]}")
+    if code == 0 and answer is not None:
+        return answer
+    return "\n".join(lines) if events else raw
+
+
 def attempt(
     reviewer: Reviewer, pristine: Path, instruction: str, total: float, idle: float, log: Path
 ) -> tuple[int, str, bytes]:
@@ -389,11 +456,13 @@ def attempt(
             snap,
             total,
             idle if reviewer.idle_timeout_applies else None,
-            agent_env(snap, reviewer.backend),
+            reviewer.env(snap),
             log,
         )
         if reviewer.backend == "amp":
             output = amp_output(code, output)
+        elif reviewer.backend == "vibe":
+            output = vibe_output(code, output)
         if code == 0 and last_message.is_file() and last_message.read_text().strip():
             output = last_message.read_text()
     try:

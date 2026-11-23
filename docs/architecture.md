@@ -29,13 +29,15 @@ skills/external-agents/scripts/
    unparsable header drops its file), and a changed-path manifest are written into the
    snapshot.
 3. **Per-backend confinement.** Project configuration that a backend would load and
-   that can run code (`.codex/`, `.opencode/`, `opencode.jsonc`, `.amp/plugins/`) is
-   removed; Claude Code is told to load user settings only. Then each backend gets a
+   that can run code (`.codex/`, `.opencode/`, `opencode.jsonc`, `.amp/plugins/`,
+   `.vibe/`) is removed; Claude Code is told to load user settings only. Then each backend gets a
    file-tools-only configuration: `claude -p` with `Read,Glob,Grep,Edit,Write`,
    `dontAsk`, and edits allowed only under the snapshot; a generated opencode agent with
    a deny-by-default permission list and `external_directory: deny`; a generated Amp
-   plugin mode with three file tools and path-matching permission rules; `codex exec
-   --sandbox workspace-write`.
+   plugin mode with three file tools and path-matching permission rules; `vibe` with
+   the `accept-edits` policy, `outside_workdir = "deny"`, shell, web and subagent tools
+   set to `never`, and those settings passed as `VIBE_*` variables, which override the
+   user's config; `codex exec --sandbox workspace-write`.
 4. **Run.** The CLI runs in its own session with an allowlisted environment. A total
    deadline and an idle deadline (for CLIs that stream output) kill the whole process
    group. Output is read in raw chunks, so a run that prints without a newline or closes

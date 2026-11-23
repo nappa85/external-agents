@@ -27,7 +27,7 @@ export EXTERNAL_REVIEWERS="codex:gpt-6.1-sol; claude:sonnet; \
 ```
 
 Each entry is `backend[:model]` with the backend's full model ID. Without a model,
-`codex` and `claude` use their own configured default; `opencode` and `amp` always need
+`codex`, `claude`, and `vibe` use their own configured default; `opencode` and `amp` always need
 one, because `opencode` may default to a free tier and `amp` serves several model
 families. Reviewers whose CLI is not installed are skipped. Prefer models from a family
 other than the host agent's.
@@ -43,24 +43,24 @@ repeatable, overrides it with one slot that tries those reviewers in order.
 | `claude`   | `claude -p` with only file tools, `dontAsk` permissions, and edits allowed only in the snapshot |
 | `opencode` | a generated `reviewer` agent with only file tools, and `external_directory` denied              |
 | `amp`      | a generated `external-reviewer` mode with only file tools, permissions limited to the snapshot  |
+| `vibe`     | `accept-edits` policy, `outside_workdir = "deny"`, shell, web, and subagent tools refused        |
 
 The snapshot prevents accidental exposure and edits. It is not a sandbox against a
 reviewer that follows instructions injected into the reviewed code:
 
-- `claude`, `opencode`, and `amp` deny reads and writes outside the snapshot.
+- `claude`, `opencode`, `amp`, and `vibe` deny reads and writes outside the snapshot.
 - `codex --sandbox workspace-write` limits writes to the snapshot and blocks network,
   but its shell can still read files elsewhere on the host.
 
 Project configuration in the snapshot that a backend would load and that can run code
 is not used: `claude` loads only user settings, and the wrapper removes `.codex/` for
-`codex`, `.opencode/` and `opencode.jsonc` for `opencode`, and `.amp/plugins/` for
-`amp`. The diff still shows changes to those files.
+`codex`, `.opencode/` and `opencode.jsonc` for `opencode`, `.amp/plugins/` for `amp`,
+and `.vibe/` for `vibe`. The diff still shows changes to those files.
 
 The reviewer process receives only an allowlisted environment: basic variables such as
 `PATH`, `HOME`, locale, proxy, and CA settings, plus provider credential prefixes such as
-`OPENAI_` and `ANTHROPIC_`. Only `amp` also receives `AMP_` variables. List any other
-variable a backend needs, such as `MISTRAL_API_KEY`, in
-`EXTERNAL_AGENTS_ENV_PASSTHROUGH`.
+`OPENAI_`, `ANTHROPIC_`, and `MISTRAL_`. Only `amp` also receives `AMP_` variables. List
+any other variable a backend needs in `EXTERNAL_AGENTS_ENV_PASSTHROUGH`.
 
 ## Amp without another CLI
 
@@ -84,6 +84,27 @@ review. It writes a project plugin into the snapshot that registers an
 and a settings file whose permissions allow those tools inside the snapshot and reject
 every other call, including paths with `..` segments. Each review creates a private Amp
 thread.
+
+## Mistral Vibe
+
+The `vibe` backend runs Mistral's Vibe CLI with the key in `MISTRAL_API_KEY` or in
+`~/.vibe/.env`. A key that `vibe --setup` keeps in the system keyring is out of reach:
+the reviewer's environment has no session bus. The model part is
+an alias from Vibe's model list (by default `mistral-large-4-0` and `mistral-medium-3.5`,
+plus any in `~/.vibe/config.toml`); without one, Vibe uses its `active_model`. `@effort`
+becomes `--thinking`, with `none` passed as `off`; each model lists the levels it
+supports in its `thinking_levels`.
+
+Vibe has no file-tools-only mode: every session also offers `bash` and `run_typescript`,
+a JavaScript tool that calls the other tools. The wrapper sets the limits as `VIBE_*`
+variables, which override `~/.vibe/config.toml`, and runs the `accept-edits` policy, so
+only edits run without approval and a headless run refuses anything that needs it.
+`outside_workdir = "deny"` refuses file tools outside the snapshot, including through a
+symlink; shell, web, and subagent tools are set to `never`; `bypass_tool_permissions`,
+background processes, subagents, MCP servers, connectors, telemetry, and session logs
+are off. `run_typescript` has no network or file access of its own, so its calls go
+through the same checks. The run uses `--output streaming`, one JSON event per tool call
+and message, so the idle timeout applies.
 
 ## Data sharing
 
@@ -139,7 +160,8 @@ and has an error line naming a provider failure, such as `Error: rate limit reac
 a review that merely discusses authorization or quotas is kept.
 
 `--idle-timeout` (default 300 s) kills a reviewer that prints nothing that long; it does
-not apply to `claude`, which prints only at the end. `amp` runs with `--stream-json`, so
+not apply to `claude`, which prints only at the end. `vibe` prints an event for each
+finished message and tool call. `amp` runs with `--stream-json`, so
 it prints an event per model turn and tool call, and a model request that hangs without
 failing trips the idle timeout instead of running into the total one. A paid reviewer
 killed that way is retried once from a fresh snapshot; a free one is not. `--timeout`

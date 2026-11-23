@@ -3,8 +3,8 @@
 **Let your coding agent call in a second opinion, or a second pair of hands.**
 
 `external-agents` is an [agent skill](skills/external-agents/SKILL.md) that teaches any
-coding agent (Claude Code, Codex, Amp, opencode, or anything that can read a skill and
-run a shell command) to use *other* agent CLIs in two roles:
+coding agent (Claude Code, Codex, Amp, opencode, Mistral Vibe, or anything that can read
+a skill and run a shell command) to use *other* agent CLIs in two roles:
 
 - 🔍 **Reviewers.** Have models from other families review a plan or a change. Different
   models catch different bugs. Reviewers work on a throwaway copy of your repository with
@@ -22,7 +22,7 @@ your laptop, in a container, in CI, or in a cloud agent's setup script.
 ```
 you ──▶ your agent (the coordinator)
           │
-          ├─ review ──▶ copy of the repo without secrets ──▶ codex / claude / opencode / amp
+          ├─ review ──▶ copy of the repo without secrets ──▶ codex / claude / opencode / amp / vibe
           │                                                   └──▶ review-1.md, review-2.md, …
           │
           └─ code ────▶ git worktree ──▶ bubblewrap sandbox ──▶ agent CLI
@@ -38,10 +38,12 @@ answers the coding agent's questions, reads the resulting diff, and commits.
 - Python 3.11 or later and git.
 - At least one agent CLI with credentials: [Codex](https://github.com/openai/codex),
   [Claude Code](https://www.anthropic.com/claude-code), [opencode](https://opencode.ai),
-  or [Amp](https://ampcode.com). The skill can install them; logging in is up to you.
+  [Amp](https://ampcode.com), or [Mistral Vibe](https://github.com/mistralai/mistral-vibe).
+  The skill can install them; logging in is up to you.
 - For coding agents: Linux with bubblewrap and unprivileged user namespaces. Reviews
   also work on macOS.
-- Node.js and npm to install Claude Code, Codex, or Amp.
+- Node.js and npm to install Claude Code, Codex, or Amp; [uv](https://docs.astral.sh/uv/)
+  to install Vibe.
 
 ## Install the skill
 

@@ -371,8 +371,10 @@ class ReviewerSelectionTests(Sandbox):
             ("codex:gpt-6.1-sol@xhigh", '-c model_reasoning_effort="xhigh"'),
             ("claude:sonnet@max", "--effort max --"),
             ("opencode:opencode/deepseek-v4.1-flash-free@high", "--agent reviewer --variant high"),
+            ("vibe:mistral-medium-3.5@high", "--model mistral-medium-3.5 --thinking high"),
+            ("vibe@none", "--output streaming --thinking off"),
         ):
-            backend = spec.partition(":")[0]
+            backend = spec.partition(":")[0].partition("@")[0]
             with self.subTest(backend=backend):
                 self.fake(backend, 'echo "$@"')
 
@@ -482,6 +484,54 @@ class ReviewerSelectionTests(Sandbox):
                 '\t\treasoningEffort: "high",',
             ],
         )
+
+    def test_vibe_reviewer_runs_confined_without_the_repository_config(self) -> None:
+        self.write(".vibe/tools/repo_tool.py", "import os\n")
+        git(self.repo, "add", "-A")
+        git(self.repo, "commit", "-q", "-m", "vibe config")
+        seen = self.root / "seen"
+        answer = {"type": "message", "role": "assistant", "content": [{"type": "text", "text": "No findings."}]}
+        self.fake(
+            "vibe",
+            f'{{ echo "key=${{MISTRAL_API_KEY:-unset}} github=${{GITHUB_TOKEN:-unset}}"; '
+            f'echo "outside=$VIBE_OUTSIDE_WORKDIR bypass=$VIBE_BYPASS_TOOL_PERMISSIONS"; ls -A; '
+            f'echo "$VIBE_TOOLS"; echo "$@"; }} > {seen}\n'
+            f"echo '{json.dumps(answer)}'",
+        )
+
+        result = self.review("--reviewer", "vibe", env={"MISTRAL_API_KEY": "m", "GITHUB_TOKEN": "gh"})
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.output.read_text(), "reviewer: vibe\nNo findings.")
+        lines = seen.read_text().splitlines()
+        self.assertEqual(lines[:2], ["key=m github=unset", "outside=deny bypass=false"])
+        self.assertNotIn(".vibe", lines)
+        tools = json.loads(next(line for line in lines if line.startswith("{")))
+        self.assertEqual(tools["bash"], {"permission": "never"})
+        self.assertRegex(lines[-1], r"^--prompt=You are a reviewer.* --workdir \S+/snapshot --agent default ")
+        self.assertTrue(lines[-1].endswith("--approval-policy accept-edits --output streaming"), lines[-1])
+
+    def test_vibe_output_keeps_the_last_answer_or_a_trace(self) -> None:
+        def entry(kind: str, **fields: object) -> str:
+            return json.dumps({"type": kind, **fields})
+
+        texts = [{"type": "text", "text": "Findings."}, {"type": "text", "text": "VERDICT: approve"}]
+        events = [
+            entry("message", role="user", content=[{"type": "text", "text": "Read the prompt"}]),
+            entry("effect", title="file_system.read_file", detail={"display": {"summary": "Reading a.py"}}),
+            "Tool call denied: file_system.bash (Tool execution denied by approval policy)",
+        ]
+
+        self.assertEqual(
+            review.vibe_output(0, "\n".join([*events, entry("message", role="assistant", content=texts)])),
+            "Findings.\n\nVERDICT: approve",
+        )
+        self.assertEqual(
+            review.vibe_output(124, "\n".join([*events, "[killed: idle timeout]"])),
+            "tool file_system.read_file: Reading a.py\n"
+            "Tool call denied: file_system.bash (Tool execution denied by approval policy)\n[killed: idle timeout]",
+        )
+        self.assertEqual(review.vibe_output(1, "Error: Invalid API key"), "Error: Invalid API key")
 
     def test_passthrough_keeps_a_named_credential(self) -> None:
         self.fake("claude", 'echo "mistral=${MISTRAL_API_KEY:-unset}"')
