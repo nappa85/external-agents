@@ -110,6 +110,29 @@ class Mailbox(unittest.TestCase):
         self.assertEqual(first.communicate(timeout=10)[0], "one\n")
         self.assertEqual(second.communicate(timeout=10)[0], "two\n")
 
+    def test_an_answer_for_the_previous_run_cannot_answer_the_current_run(self) -> None:
+        self.box.post("previous run")
+        shown = self.cli("question")
+        self.assertEqual((shown.returncode, shown.stdout), (0, "previous run\n"))
+        old_id = shown.stderr.split()[-1]
+        self.server.close()
+
+        run = self.state / "run-2"
+        (run / "ask").mkdir(parents=True)
+        latest = self.state / "latest"
+        latest.unlink()
+        latest.symlink_to(run.name)
+        box = mailbox.Mailbox(run / "questions.log")
+        server = mailbox.Server(box, run / "ask/sock", run / "control.sock")
+        self.addCleanup(server.close)
+        server.start()
+        box.post("current run")
+
+        reply = self.cli("answer", "--to", old_id, "for the previous run")
+
+        self.assertEqual(reply.returncode, 2, reply.stderr)
+        self.assertEqual(self.cli("question").stdout, "current run\n")
+
     def test_the_agent_cannot_starve_the_coordinators_control_socket(self) -> None:
         # The sandboxed agent may open as many connections to its socket as it likes; each
         # holds a handler slot until its request deadline. The coordinator's socket must keep

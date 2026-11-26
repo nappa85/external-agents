@@ -440,6 +440,68 @@ class Refusals(unittest.TestCase):
             with mock.patch.object(sandbox, "Proxy", side_effect=AssertionError("the sandbox was launched")):
                 self.assertIn("git", self.refusal(args))
 
+    def test_cli_env_overrides_inherited_credentials_and_backend_defaults(self) -> None:
+        seen_argv: list[str] = []
+
+        class Stop(Exception):
+            pass
+
+        real_popen = subprocess.Popen
+
+        def popen(argv: list[str], **kwargs: object) -> object:
+            if "bwrap" not in argv:
+                return real_popen(argv, **kwargs)
+            seen_argv.extend(argv)
+            raise Stop
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tree = worktree(Path(tmp))
+            args = self.namespace(
+                tree, Path(tmp, "state"), agent="codex", env=["OPENAI_BASE_URL=https://cli.example"], no_seccomp=True
+            )
+            with (
+                mock.patch.dict(os.environ, {"OPENAI_BASE_URL": "https://host.example"}),
+                mock.patch.object(sandbox.shutil, "which", return_value="/usr/bin/true"),
+                mock.patch.object(sandbox.subprocess, "Popen", popen),
+                self.assertRaises(Stop),
+            ):
+                sandbox.code(args, ["true"])
+        pairs = {seen_argv[i + 1]: seen_argv[i + 2] for i, token in enumerate(seen_argv) if token == "--setenv"}
+        self.assertEqual(pairs.get("OPENAI_BASE_URL"), "https://cli.example")
+
+    def test_empty_hosts_replaces_default_egress_and_strips_spaces(self) -> None:
+        seen_hosts: list[list[str]] = []
+
+        class Stop(Exception):
+            pass
+
+        real_proxy = sandbox.Proxy
+        real_popen = subprocess.Popen
+
+        def recording_proxy(path: Path, hosts: list[str], log_hosts: bool) -> proxy.Proxy:
+            seen_hosts.append(list(hosts))
+            return real_proxy(path, hosts, log_hosts)
+
+        def popen(argv: list[str], **kwargs: object) -> object:
+            if "bwrap" not in argv:
+                return real_popen(argv, **kwargs)
+            raise Stop
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tree = worktree(Path(tmp))
+            for index, raw_hosts in enumerate(("", "chatgpt.com, api.openai.com")):
+                args = self.namespace(
+                    tree, Path(tmp, f"state-{index}"), agent="codex", hosts=raw_hosts, no_seccomp=True
+                )
+                with (
+                    mock.patch.object(sandbox.shutil, "which", return_value="/usr/bin/true"),
+                    mock.patch.object(sandbox, "Proxy", recording_proxy),
+                    mock.patch.object(sandbox.subprocess, "Popen", popen),
+                    self.assertRaises(Stop),
+                ):
+                    sandbox.code(args, ["true"])
+        self.assertEqual(seen_hosts, [[], ["chatgpt.com", "api.openai.com"]])
+
     def test_a_target_link_is_refused(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             tree = worktree(Path(tmp))

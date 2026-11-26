@@ -9,6 +9,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from support import SCRIPT, common, review, snapshot
 from xagents.backends import INSTALLERS
@@ -121,6 +122,22 @@ class SnapshotTests(Sandbox):
         self.assertIn("+fn new() {}", diff)
         self.assertEqual(names, "M\tsrc/lib.rs\nA\tsrc/new.rs\n")
 
+    def test_base_diff_preserves_crlf_in_tracked_and_untracked_hunks(self) -> None:
+        git(self.repo, "config", "core.autocrlf", "false")
+        self.write(".gitattributes", "*.txt -text\n")
+        tracked = self.repo / "tracked.txt"
+        tracked.write_bytes(b"before\r\n")
+        git(self.repo, "add", ".gitattributes", "tracked.txt")
+        git(self.repo, "commit", "-q", "-m", "CRLF fixture")
+        tracked.write_bytes(b"after\r\n")
+        (self.repo / "untracked.txt").write_bytes(b"new file\r\n")
+
+        diff, names = snapshot.filter_patch(snapshot.base_diff(self.repo, "HEAD"))
+
+        self.assertIn("-before\r\n+after\r\n", diff)
+        self.assertIn("+new file\r\n", diff)
+        self.assertEqual(names, "M\ttracked.txt\nA\tuntracked.txt\n")
+
     def test_base_diff_does_not_depend_on_the_users_diff_configuration(self) -> None:
         self.write("src/lib.rs", "fn changed() {}\n")
         self.write("src/new.rs", "fn new() {}\n")
@@ -227,6 +244,35 @@ class SnapshotTests(Sandbox):
 
         self.assertFalse((dest / "src").exists())
         self.assertTrue((dest / "AGENTS.md").is_file())
+
+    def test_a_directory_replaced_by_a_link_into_git_metadata_is_not_copied(self) -> None:
+        # Git still lists the directory's old paths, which now name files in `.git`.
+        self.write("cfg/config", "[app]\n")
+        git(self.repo, "add", "-A")
+        git(self.repo, "commit", "-q", "-m", "cfg")
+        git(self.repo, "config", "remote.origin.url", "https://user:TOKEN@example.com/repo.git")
+        shutil.rmtree(self.repo / "cfg")
+        (self.repo / "cfg").symlink_to(self.repo / ".git", target_is_directory=True)
+        dest = self.root / "snapshot"
+
+        snapshot.snapshot(self.repo, dest, [])
+
+        self.assertFalse((dest / "cfg/config").exists())
+        self.assertTrue((dest / "AGENTS.md").is_file())
+
+    def test_including_git_file_is_refused(self) -> None:
+        self.write("sub/.git", "gitdir: /elsewhere\n")
+
+        with self.assertRaisesRegex(common.UsageError, "secret-like"):
+            snapshot.snapshot(self.repo, self.root / "snapshot", [Path("sub/.git")])
+
+    def test_write_generated_replaces_an_existing_directory(self) -> None:
+        target = self.root / "REVIEW_PROMPT.md"
+        target.mkdir()
+
+        common.write_generated(target, "prompt\n")
+
+        self.assertEqual(target.read_text(), "prompt\n")
 
     def test_include_outside_the_source_is_refused(self) -> None:
         outside = self.root / "outside.md"
@@ -452,6 +498,17 @@ class ReviewerSelectionTests(Sandbox):
         self.assertEqual((self.repo / "snapshot/nested.rs").read_text(), "fn moved() {}\n")
         self.assertEqual((self.repo / "crlf.txt").read_bytes(), b"a\r\nc\r\n")
 
+    def test_preflight_is_not_passed_by_a_cli_that_only_echoes_its_prompt(self) -> None:
+        # Like `codex exec`, which prints the user turn: it exits 0 without answering.
+        self.fake("codex", 'for last; do :; done; echo user; echo "$last"; echo "ERROR: stream disconnected"')
+        pristine = self.root / "work" / "pristine"
+        pristine.mkdir(parents=True)
+
+        with mock.patch.dict(os.environ, {"PATH": f"{self.bin}:{self.tools}"}):
+            passed = review.preflight(review.Reviewer("codex", None), pristine, self.root / "log", 10, attempts=1)
+
+        self.assertFalse(passed)
+
     def test_unconfigured_panel_runs_no_external_reviewer(self) -> None:
         self.fake("claude", "echo claude review")
 
@@ -544,6 +601,61 @@ class ReviewerSelectionTests(Sandbox):
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.output.read_text(), "reviewer: claude\nM\tsrc/lib.rs\n0\n")
+
+    def test_a_supplied_diff_inside_the_checkout_is_only_shared_after_filtering(self) -> None:
+        self.write("src/lib.rs", "fn changed() {}\n")
+        self.write(".env", "DUMMY_TOKEN=not-real\n")
+        git(self.repo, "add", "-f", ".env")
+        patch = self.repo / "change.patch"
+        raw = snapshot.base_diff(self.repo, "HEAD")
+        self.assertIn("DUMMY_TOKEN", raw)
+        patch.write_text(raw)
+        self.fake(
+            "claude",
+            'grep -q "fn changed" REVIEW_DIFF.patch && ! grep -q DUMMY_TOKEN REVIEW_DIFF.patch && '
+            'test ! -e change.patch && echo "only the filtered diff is visible"',
+        )
+
+        result = self.review("--diff-file", str(patch))
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("only the filtered diff is visible", self.output.read_text())
+
+    def test_review_artifacts_inside_the_checkout_are_not_shared_with_the_next_reviewer(self) -> None:
+        self.output = self.repo / "reviews" / "review-1.md"
+        self.fake("claude", 'echo "proposed edit" > src/lib.rs; echo first review')
+        first = self.run_script(
+            "review", "--prompt-file", str(self.prompt), "--no-preflight", "--reviewer", "claude",
+            "--output-dir", str(self.output.parent),
+        )  # fmt: skip
+        self.assertEqual(first.returncode, 0, first.stderr)
+        self.assertTrue(self.output.with_suffix(".patch").is_file())
+        self.fake(
+            "claude",
+            "test ! -e reviews/review-1.md && test ! -e reviews/review-1.log && "
+            "test ! -e reviews/review-1.patch && "
+            "! grep -qF reviews/review-1. REVIEW_DIFF.patch REVIEW_FILES.txt && echo independent review",
+        )
+
+        result = self.review("--base", "HEAD")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("independent review", self.output.read_text())
+
+    def test_reusing_an_output_does_not_leave_an_older_reviewers_patch(self) -> None:
+        for body, status in (("echo review without edits", 0), ("exit 1", 3)):
+            with self.subTest(status=status):
+                self.fake("claude", 'echo "proposed edit" > src/lib.rs; echo review with edits')
+                first = self.review()
+                self.assertEqual(first.returncode, 0, first.stderr)
+                patch = self.output.with_suffix(".patch")
+                self.assertTrue(patch.is_file())
+                self.fake("claude", body)
+
+                second = self.review()
+
+                self.assertEqual(second.returncode, status, second.stderr)
+                self.assertFalse(patch.exists())
 
     def test_output_in_a_missing_directory_is_a_usage_error(self) -> None:
         self.fake("claude", "echo review")
@@ -681,6 +793,20 @@ class ReviewerSelectionTests(Sandbox):
         )
         self.assertEqual(review.vibe_output(1, "Error: Invalid API key"), "Error: Invalid API key")
 
+    def test_amp_output_survives_events_of_an_unexpected_shape(self) -> None:
+        raw = "\n".join(
+            [
+                json.dumps({"type": "assistant", "session_id": "T-1", "message": None}),
+                json.dumps({"type": "assistant", "message": {"content": ["plain string block"]}}),
+                "[killed: idle timeout]",
+            ]
+        )
+
+        output = review.amp_output(124, raw)
+
+        self.assertEqual(review.classify(124, output), "stalled")
+        self.assertIn("amp thread: T-1", output)
+
     def test_passthrough_keeps_a_named_credential(self) -> None:
         self.fake("claude", 'echo "mistral=${MISTRAL_API_KEY:-unset}"')
 
@@ -804,6 +930,38 @@ class PatchFilterTests(unittest.TestCase):
         patch = 'diff --git "a/x.rs" b/.env\n+TOKEN=secret\n'
 
         self.assertEqual(snapshot.filter_patch(patch), ("", ""))
+
+    def test_mixed_quoted_and_unquoted_headers_are_kept_and_filtered(self) -> None:
+        patch = (
+            'diff --git a/dev/null "b/d\\303\\251/ok.rs"\nnew file mode 100644\n+fn ok() {}\n'
+            'diff --git a/dev/null "b/d\\303\\251/.env"\nnew file mode 100644\n+TOKEN=secret\n'
+            'diff --git a/src/old.rs "b/src/d\\303\\251.rs"\nrename from src/old.rs\nrename to "src/d\\303\\251.rs"\n'
+        )
+
+        diff, names = snapshot.filter_patch(patch)
+
+        self.assertNotIn("TOKEN", diff)
+        self.assertIn("+fn ok() {}", diff)
+        self.assertEqual(names, "A\td\u00e9/ok.rs\nR\tsrc/d\u00e9.rs\n")
+
+    def test_crlf_patch_still_filters_added_secret_files(self) -> None:
+        patch = (
+            "diff --git a/dev/null b/.env\r\nnew file mode 100644\r\n+TOKEN=secret\r\n"
+            "diff --git a/src/lib.rs b/src/lib.rs\r\n+fn ok() {}\r\n"
+        )
+
+        diff, names = snapshot.filter_patch(patch)
+
+        self.assertNotIn("TOKEN", diff)
+        self.assertEqual(names, "M\tsrc/lib.rs\n")
+
+    def test_rename_from_secret_to_name_with_b_slash_is_filtered(self) -> None:
+        patch = "diff --git a/.env b/safe b/x.txt\nrename from .env\nrename to safe b/x.txt\n-TOKEN=secret\n"
+
+        diff, names = snapshot.filter_patch(patch)
+
+        self.assertNotIn("TOKEN", diff)
+        self.assertEqual(names, "")
 
     def test_a_secret_in_a_plain_unified_diff_is_filtered(self) -> None:
         # `--diff-file` accepts any diff, such as one from `diff -ruN` or another VCS,
