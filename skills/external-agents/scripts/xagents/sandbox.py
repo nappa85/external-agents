@@ -287,11 +287,14 @@ def masks(worktree: Path) -> tuple[list[Path], list[Path]]:
     return sorted(files), sorted(directories)
 
 
-def bwrap_args(worktree: Path, run: Path, mounts: Mounts, hidden: tuple[list[Path], list[Path]]) -> list[str]:
+def bwrap_args(
+    worktree: Path, run: Path, mounts: Mounts, hidden: tuple[list[Path], list[Path]], seccomp_fd: int | None = None
+) -> list[str]:
     home = str(HOME)
     args = ["bwrap", "--die-with-parent", "--new-session", "--unshare-all", "--unshare-user", "--disable-userns"]
-    if (run / "seccomp.bpf").exists():
-        args += ["--seccomp", "9"]
+    if seccomp_fd is not None:
+        # bwrap reads the filter from this inherited descriptor.
+        args += ["--seccomp", str(seccomp_fd)]
     for top in SYSTEM_DIRS:
         if os.path.islink(top):
             args += ["--symlink", os.readlink(top), top]
@@ -455,25 +458,22 @@ def code(args: argparse.Namespace, command: list[str] | None) -> int:
         (run / "seccomp.bpf").write_bytes(seccomp.encode(seccomp.program()))
     elif not args.no_seccomp:
         fail(f"the seccomp filter supports x86_64 only; pass --no-seccomp to run on {platform.machine()} without it")
+    # bwrap reads the filter from whatever descriptor it lands on (`--seccomp N`). Moving it to
+    # a fixed number with dup2 failed with EBUSY whenever another thread was opening a file
+    # into that number at the same moment.
+    bpf = os.open(run / "seccomp.bpf", os.O_RDONLY) if (run / "seccomp.bpf").exists() else None
     proxy = Proxy(run / "proxy" / "sock", hosts, args.log_hosts)
     proxy.start()
     questions = mailbox.Server(mailbox.Mailbox(run / "questions.log"), run / "ask" / "sock", run / "control.sock")
     questions.start()
-    argv = bwrap_args(worktree, run, mounts, masks(worktree))
+    argv = bwrap_args(worktree, run, mounts, masks(worktree), bpf)
     argv += [python, "-I", f"{TOOL_DIR}/forward.py", *command]
     print(f"xagents: run {run.name}, egress {', '.join(hosts) or 'none'}", file=sys.stderr)
 
-    # bwrap reads the filter from descriptor 9 (`--seccomp 9`).
-    filtered = (run / "seccomp.bpf").exists()
-    if filtered:
-        bpf = os.open(run / "seccomp.bpf", os.O_RDONLY)
-        if bpf != 9:
-            os.dup2(bpf, 9, inheritable=True)
-            os.close(bpf)
     try:
         child = subprocess.Popen(
             [sys.executable, "-I", "-c", CONFINE, ",".join(map(str, cpus or [])), *argv],
-            pass_fds=(9,) if filtered else (),
+            pass_fds=(bpf,) if bpf is not None else (),
         )
         try:
             code = child.wait(timeout=args.timeout)
@@ -487,8 +487,8 @@ def code(args: argparse.Namespace, command: list[str] | None) -> int:
             print(f"xagents: stopped after {args.timeout} s", file=sys.stderr)
             code = 124
     finally:
-        if filtered:
-            os.close(9)
+        if bpf is not None:
+            os.close(bpf)
         proxy.server.close()
         questions.close()
     print(

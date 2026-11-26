@@ -6,6 +6,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- `code` could fail at start with `OSError: [Errno 16] Device or resource busy`: it moved
+  the seccomp filter to descriptor 9 with `dup2`, which fails when another thread is
+  opening a file into that number at the same moment. bwrap now reads the filter from the
+  descriptor it was opened on (`--seccomp N`).
+
 ### Added
 
 - `EXTERNAL_AGENTS_AMP_NO_CREDITS=1` runs an `amp` reviewer only when a provider

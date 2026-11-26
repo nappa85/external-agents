@@ -364,6 +364,46 @@ class Refusals(unittest.TestCase):
             self.assertIn("plain directory", self.refusal(self.namespace(tree, state, preset=["rust"])))
 
 
+@unittest.skipUnless(os.uname().machine == "x86_64", "the seccomp filter is x86_64 only")
+class SeccompDescriptor(unittest.TestCase):
+    """The filter goes to bwrap on the descriptor it was opened on. Moving it to a fixed
+    number with dup2 failed with EBUSY whenever another thread was opening a file into that
+    number at the same moment."""
+
+    def test_bwrap_reads_the_filter_from_the_descriptor_passed_to_it_without_dup2(self) -> None:
+        seen: dict[str, object] = {}
+
+        class Stop(Exception):
+            pass
+
+        real_popen = subprocess.Popen
+
+        def popen(argv: list[str], pass_fds: tuple[int, ...] = (), **kwargs: object) -> object:
+            if "--seccomp" not in argv:  # the launcher's own helpers, such as `git ls-files`
+                return real_popen(argv, pass_fds=pass_fds, **kwargs)
+            number = int(argv[argv.index("--seccomp") + 1])
+            seen.update(number=number, pass_fds=pass_fds, target=os.readlink(f"/proc/self/fd/{number}"))
+            raise Stop
+
+        def no_dup2(*_args: object, **_kwargs: object) -> None:
+            raise AssertionError("dup2 races with other threads opening files")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tree = worktree(Path(tmp))
+            args = Refusals().namespace(tree, Path(tmp, "state"))
+            with (
+                mock.patch.object(sandbox.shutil, "which", return_value="/usr/bin/true"),
+                mock.patch.object(sandbox.subprocess, "Popen", popen),
+                mock.patch.object(sandbox.os, "dup2", no_dup2),
+                self.assertRaises(Stop),
+            ):
+                sandbox.code(args, ["true"])
+            self.assertEqual(seen["pass_fds"], (seen["number"],))
+            self.assertTrue(str(seen["target"]).endswith("seccomp.bpf"), seen["target"])
+            with self.assertRaises(OSError):
+                os.readlink(f"/proc/self/fd/{seen['number']}")  # closed after the run
+
+
 @unittest.skipUnless(shutil.which("bwrap"), "needs bwrap")
 class LiveSandbox(unittest.TestCase):
     """Runs the real launcher with a probe command: dummy secrets, no model, no network."""
