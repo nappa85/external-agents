@@ -17,6 +17,7 @@ import json
 import os
 import re
 import shutil
+import subprocess
 import sys
 import tempfile
 import time
@@ -35,7 +36,16 @@ from .backends import (
     VIBE_QUIET,
     parse_agent,
 )
-from .common import ENV_REVIEWERS, UsageError, agent_env, installed, remove, run_with_timeouts, write_generated
+from .common import (
+    ENV_AMP_NO_CREDITS,
+    ENV_REVIEWERS,
+    UsageError,
+    agent_env,
+    installed,
+    remove,
+    run_with_timeouts,
+    write_generated,
+)
 from .snapshot import Changes, base_diff, filter_patch, snapshot
 
 PROMPT_FILE = "REVIEW_PROMPT.md"
@@ -485,6 +495,55 @@ def preflight(reviewer: Reviewer, pristine: Path, log: Path, timeout: float = 90
     return False
 
 
+def amp_credit_problem(reviewer: Reviewer, cwd: Path, log: Path, timeout: float = 120) -> str | None:
+    """Why an `amp` reviewer may not run under EXTERNAL_AGENTS_AMP_NO_CREDITS, or None.
+
+    `check-access` runs a small inference and reports what served it: a connection linked
+    to the user's Amp account (`model-provider`) or Amp itself, on credits."""
+    command = ["amp", "config", "model-providers", "check-access", "--provider-model", str(reviewer.model)]
+    if reviewer.effort:
+        command += ["--reasoning-effort", reviewer.effort]
+    with log.open("a") as out:
+        out.write(f"\n=== {reviewer.label}: model routing check\n")
+    try:
+        result = subprocess.run(
+            command, cwd=cwd, capture_output=True, text=True, errors="replace", timeout=timeout, check=False
+        )
+    except subprocess.TimeoutExpired as error:
+        partial = b"".join(p if isinstance(p, bytes) else p.encode() for p in (error.stdout, error.stderr) if p)
+        with log.open("a") as out:
+            out.write(partial.decode(errors="replace"))
+        problem = f"its model routing check timed out after {timeout:.0f} s"
+    except OSError as error:
+        problem = f"its model routing check could not run: {error}"
+    else:
+        output = result.stdout + result.stderr
+        with log.open("a") as out:
+            out.write(f"{output.rstrip()}\n(exit {result.returncode})\n")
+        try:
+            report = json.loads(result.stdout)
+        except json.JSONDecodeError:
+            report = None
+        ok = result.returncode == 0 and isinstance(report, dict) and report.get("ok") is True
+        routing = report.get("modelRouting") if isinstance(report, dict) else None
+        if not isinstance(routing, dict):
+            routing = {}
+        kind = routing.get("kind")
+        if ok and kind == "model-provider":
+            return None
+        if ok and kind == "upstream-model-provider":
+            name = routing.get("modelProviderName") or routing.get("modelProviderID") or "Amp"
+            problem = (
+                f"Amp credits would pay for {reviewer.model} (served by {name}), and {ENV_AMP_NO_CREDITS} forbids them"
+            )
+        else:
+            tail = " ".join(output.split())[-300:]
+            problem = f"its model routing check failed (exit {result.returncode}, routing {kind or 'unknown'}): {tail}"
+    with log.open("a") as out:
+        out.write(f"{problem}\n")
+    return problem
+
+
 @dataclass(frozen=True)
 class Options:
     total: float
@@ -508,6 +567,15 @@ def review_with_fallback(
             if reviewer.free and limited_today(reviewer):
                 log.append(f"{reviewer.label}: skipped (limited earlier today)")
                 print(f"{reviewer.label}: limited earlier today; trying the next reviewer.", file=sys.stderr)
+                continue
+            # A billing rule, not a health check, so --no-preflight does not skip it.
+            if (
+                reviewer.backend == "amp"
+                and os.environ.get(ENV_AMP_NO_CREDITS) == "1"
+                and (problem := amp_credit_problem(reviewer, pristine.parent, run_log))
+            ):
+                log.append(f"{reviewer.label}: unavailable ({problem})")
+                print(f"{reviewer.label}: unavailable ({problem}); trying the next reviewer.", file=sys.stderr)
                 continue
             if options.preflight and not preflight(reviewer, pristine, run_log):
                 log.append(f"{reviewer.label}: preflight failed")

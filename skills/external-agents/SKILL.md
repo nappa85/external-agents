@@ -37,6 +37,7 @@ not configure, unless they ask for it in the conversation.
 | `EXTERNAL_CODER`                  | Coding agent, for example `opencode:openai/gpt-6.1-sol`                    |
 | `EXTERNAL_AGENTS_ENV_PASSTHROUGH` | Extra variable names, comma-separated, that agents receive                 |
 | `EXTERNAL_AGENTS_PIN`             | `1` makes `install` replace an installed CLI with the pinned version       |
+| `EXTERNAL_AGENTS_AMP_NO_CREDITS`  | `1` runs an `amp` reviewer only on a provider linked to the Amp account    |
 
 Run `detect` once per session. It prints JSON with the resolved reviewer panel, the
 coder, whether bubblewrap works, and `missing`: each configured backend whose CLI is

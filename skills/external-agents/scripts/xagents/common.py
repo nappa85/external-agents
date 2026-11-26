@@ -21,6 +21,9 @@ ENV_CODER = "EXTERNAL_CODER"
 # Extra variables, comma-separated, that an agent process receives, such as a provider key
 # with an unusual name.
 ENV_PASSTHROUGH = "EXTERNAL_AGENTS_ENV_PASSTHROUGH"
+# `1` runs an `amp` reviewer only when a provider connection linked to the Amp account
+# serves its model, never on Amp credits.
+ENV_AMP_NO_CREDITS = "EXTERNAL_AGENTS_AMP_NO_CREDITS"
 
 SKILL_DIR = Path(__file__).resolve().parents[2]
 SCRIPTS_DIR = SKILL_DIR / "scripts"

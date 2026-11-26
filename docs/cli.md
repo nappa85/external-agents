@@ -16,6 +16,7 @@ python3 -I skills/external-agents/scripts/external_agents.py <command> [options]
 | `EXTERNAL_CODER`                  | `code`, `detect`, `install`   | coding agent, `backend[:model]`                                   |
 | `EXTERNAL_AGENTS_ENV_PASSTHROUGH` | `review`, `code`  | extra variable names, comma-separated, passed to agents                       |
 | `EXTERNAL_AGENTS_PIN`             | install scripts   | `1` replaces an installed CLI of another version with the pinned one          |
+| `EXTERNAL_AGENTS_AMP_NO_CREDITS`  | `review`          | `1` runs an `amp` reviewer only on a provider connection linked to the account; its routing check may cost a few Amp credits and, outside an Amp thread, needs `AMP_THREAD_ID` |
 | `XDG_STATE_HOME`                  | `review`          | where the free-tier ledger lives (default `~/.local/state`)                   |
 
 Agents otherwise receive only basic variables (`PATH`, `HOME`, locale, proxy, CA

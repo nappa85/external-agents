@@ -78,6 +78,16 @@ Every backend takes the `@effort` suffix: `none`, `minimal`, `low`, `medium`, `h
 `xhigh`, or `max`. `claude` accepts only `low` through `max`, for example
 `claude:sonnet@high`.
 
+Amp serves a model through a provider key or subscription linked to the Amp account,
+such as a ChatGPT subscription, when one covers it, and bills Amp credits otherwise. With
+`EXTERNAL_AGENTS_AMP_NO_CREDITS=1`, each `amp` reviewer first runs `amp config
+model-providers check-access` on its model and effort, even with `--no-preflight`. When no
+linked connection serves the model, or the check fails, the reviewer is unavailable: the
+slot tries its next reviewer and the log says why. The check is a small inference, so it
+costs a few Amp credits when credits would serve the model. `check-access` associates that
+inference with an Amp thread you own, from `AMP_THREAD_ID`; outside an Amp thread, set it
+to any thread you own, or the check fails and every `amp` reviewer is unavailable.
+
 Amp's built-in modes have shell and edit tools, so the wrapper never uses them for a
 review. It writes a project plugin into the snapshot that registers an
 `external-reviewer` mode whose agent has only `Read`, `create_file`, and `edit_file`,
