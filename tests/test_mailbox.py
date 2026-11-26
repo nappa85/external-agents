@@ -110,6 +110,24 @@ class Mailbox(unittest.TestCase):
         self.assertEqual(first.communicate(timeout=10)[0], "one\n")
         self.assertEqual(second.communicate(timeout=10)[0], "two\n")
 
+    def test_the_agent_cannot_starve_the_coordinators_control_socket(self) -> None:
+        # The sandboxed agent may open as many connections to its socket as it likes; each
+        # holds a handler slot until its request deadline. The coordinator's socket must keep
+        # answering, and must not report that the run ended.
+        held = []
+        for _ in range(4 * mailbox.MAX_CLIENTS):
+            client = socket.socket(socket.AF_UNIX)
+            client.connect(str(self.ask_socket))
+            held.append(client)
+        self.addCleanup(lambda: [client.close() for client in held])
+        time.sleep(0.5)
+
+        shown = self.cli("question")
+
+        # Exit 1 alone would also match an uncaught exception.
+        self.assertNotIn("Traceback", shown.stderr)
+        self.assertEqual((shown.returncode, shown.stdout, shown.stderr), (1, "", ""))
+
     def test_an_asker_that_hangs_up_withdraws_its_question(self) -> None:
         asker = self.ask("never mind")
         self.wait_for_question()

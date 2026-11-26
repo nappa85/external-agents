@@ -136,6 +136,57 @@ class SnapshotTests(Sandbox):
                 self.assertIn("+fn changed() {}", diff)
                 self.assertEqual(names, "M\tsrc/lib.rs\nA\tsrc/new.rs\n")
 
+    def test_base_diff_of_a_subdirectory_uses_the_snapshots_paths(self) -> None:
+        # `--source` may name a subdirectory; the snapshot holds its files relative to it,
+        # so every diff header must too, tracked and untracked alike.
+        source = self.repo / "src"
+        self.write("src/lib.rs", "fn changed() {}\n")
+        self.write("src/new.rs", "fn new() {}\n")
+
+        diff = snapshot.base_diff(source, "HEAD")
+
+        headers = sorted(line for line in diff.splitlines() if line.startswith("diff --git"))
+        self.assertEqual(headers, ["diff --git a/lib.rs b/lib.rs", "diff --git a/new.rs b/new.rs"])
+        self.assertEqual(snapshot.source_files(source), [Path("lib.rs"), Path("new.rs")])
+
+    def test_changes_ignore_configuration_written_into_the_recording_repository(self) -> None:
+        # The recording repository sits next to the snapshot, where a codex reviewer can
+        # write (its workspace-write sandbox allows /tmp). Configuration planted there must
+        # not make the wrapper's own git run commands on the host.
+        snap = self.root / "snap"
+        snap.mkdir()
+        (snap / "a.txt").write_text("a\n")
+        git_dir = self.root / "changes.git"
+        changes = snapshot.Changes(git_dir, snap, ())
+        before = changes.tree()
+        marker = self.root / "ran"
+        with (git_dir / "config").open("a") as config:
+            config.write(f'[core]\n\tfsmonitor = "touch {marker}-fsmonitor; false"\n')
+            config.write(f'[filter "x"]\n\tclean = "touch {marker}-filter; cat"\n')
+        with (git_dir / "info" / "attributes").open("a") as attributes:
+            attributes.write("* filter=x\n")
+        (snap / "a.txt").write_text("b\n")
+
+        diff = changes.diff(before, changes.tree())
+
+        self.assertIn(b"+b", diff)
+        self.assertEqual(sorted(p.name for p in self.root.glob("ran-*")), [])
+
+    def test_non_utf8_content_and_names_survive_snapshot_and_diff(self) -> None:
+        # Latin-1 fixtures and file names are ordinary in real repositories.
+        (self.repo / "src/lib.rs").write_bytes(b"caf\xe9\n")
+        git(self.repo, "add", "-A")
+        git(self.repo, "commit", "-q", "-m", "latin-1")
+        (self.repo / "src/lib.rs").write_bytes(b"caf\xe9 au lait\n")
+        name = os.fsdecode(b"b\xe9.txt")
+        (self.repo / name).write_text("new\n")
+
+        diff = snapshot.base_diff(self.repo, "HEAD")
+        snapshot.snapshot(self.repo, self.root / "snap", [])
+
+        self.assertIn("diff --git a/src/lib.rs b/src/lib.rs", diff)
+        self.assertTrue((self.root / "snap" / name).is_file())
+
     def test_diff_omits_tracked_and_untracked_secret_files(self) -> None:
         self.write("config/.env", "TOKEN=old\n")
         self.write("certs/server.key", "old-key\n")
@@ -245,6 +296,27 @@ class ReviewerSelectionTests(Sandbox):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual((self.root / "out/review-1.md").read_text(), 'reviewer: amp:p/one\nmodel: "p/one"\n')
         self.assertEqual((self.root / "out/review-2.md").read_text(), 'reviewer: amp:p/two\nmodel: "p/two"\n')
+
+    def test_a_slot_that_crashes_does_not_discard_the_other_slots_reviews(self) -> None:
+        # A tracked file named `.amp` makes the amp slot fail while it writes its
+        # configuration; the claude slot's finished review must still be written, and the
+        # amp slot must report its own outcome.
+        self.write(".amp", "not a directory\n")
+        git(self.repo, "add", "-A")
+        git(self.repo, "commit", "-q", "-m", "dot amp file")
+        self.fake("claude", "echo claude review")
+        self.fake("amp", "echo amp review")
+
+        result = self.run_script(
+            "review", "--prompt-file", str(self.prompt), "--output-dir", str(self.root / "out"), "--no-preflight",
+            env={"EXTERNAL_REVIEWERS": "claude; amp:p/model"},
+        )  # fmt: skip
+
+        self.assertNotIn("Traceback", result.stderr)
+        self.assertEqual((self.root / "out/review-1.md").read_text(), "reviewer: claude\nclaude review\n")
+        self.assertTrue((self.root / "out/review-2.md").is_file(), result.stderr)
+        # 0 once the amp slot copes with the file, 3 while it still fails on its own.
+        self.assertIn(result.returncode, (0, 3), result.stderr)
 
     def fake_amp(self, report: str, exit_code: int = 0) -> Path:
         """An `amp` whose `check-access` prints `report`, exits `exit_code`, and records its arguments."""
@@ -472,6 +544,17 @@ class ReviewerSelectionTests(Sandbox):
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.output.read_text(), "reviewer: claude\nM\tsrc/lib.rs\n0\n")
+
+    def test_output_in_a_missing_directory_is_a_usage_error(self) -> None:
+        self.fake("claude", "echo review")
+
+        result = self.run_script(
+            "review", "--prompt-file", str(self.prompt), "--output", str(self.root / "missing/review.md"),
+            "--no-preflight", env={"EXTERNAL_REVIEWERS": "claude"},
+        )  # fmt: skip
+
+        self.assertNotIn("Traceback", result.stderr)
+        self.assertEqual(result.returncode, 2, result.stderr)
 
     def test_missing_diff_file_is_a_usage_error(self) -> None:
         self.fake("claude", "echo review")
@@ -722,6 +805,15 @@ class PatchFilterTests(unittest.TestCase):
 
         self.assertEqual(snapshot.filter_patch(patch), ("", ""))
 
+    def test_a_secret_in_a_plain_unified_diff_is_filtered(self) -> None:
+        # `--diff-file` accepts any diff, such as one from `diff -ruN` or another VCS,
+        # whose file headers are not `diff --git` lines.
+        patch = "--- a/.env\n+++ b/.env\n@@ -0,0 +1 @@\n+TOKEN=secret\n"
+
+        diff, _ = snapshot.filter_patch(patch)
+
+        self.assertNotIn("TOKEN", diff)
+
 
 class TimeoutTests(unittest.TestCase):
     def test_output_without_a_newline_does_not_defeat_the_timeout(self) -> None:
@@ -748,6 +840,17 @@ class TimeoutTests(unittest.TestCase):
             code, output = common.run_with_timeouts(command, Path(tmp), total=10, idle=None, env=dict(os.environ))
 
         self.assertEqual((code, output), (0, "review\n"))
+
+    def test_a_chatty_descendant_does_not_turn_a_finished_run_into_a_timeout(self) -> None:
+        # A CLI may leave a child that keeps writing to the inherited stdout after the CLI
+        # itself exited with its review.
+        with tempfile.TemporaryDirectory() as tmp:
+            command = ["sh", "-c", "echo review; (while :; do echo tick; sleep 0.2; done) & exit 0"]
+
+            code, output = common.run_with_timeouts(command, Path(tmp), total=5, idle=None, env=dict(os.environ))
+
+        self.assertEqual(code, 0, output[-200:])
+        self.assertTrue(output.startswith("review\n"), output[:200])
 
 
 if __name__ == "__main__":
