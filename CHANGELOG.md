@@ -4,6 +4,16 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- `EXTERNAL_AGENTS_AMP_NO_CREDITS=1` runs an `amp` reviewer only when a provider
+  connection linked to the Amp account, such as a ChatGPT subscription, serves its model.
+  `amp config model-providers check-access` decides before each `amp` reviewer runs; a
+  model Amp credits would pay for, or a failed check, makes the reviewer unavailable, so
+  the slot falls back. Outside an Amp thread, the check needs `AMP_THREAD_ID`.
+
 ## [0.1.4] - 2026-11-23
 
 ### Added

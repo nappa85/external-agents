@@ -246,6 +246,71 @@ class ReviewerSelectionTests(Sandbox):
         self.assertEqual((self.root / "out/review-1.md").read_text(), 'reviewer: amp:p/one\nmodel: "p/one"\n')
         self.assertEqual((self.root / "out/review-2.md").read_text(), 'reviewer: amp:p/two\nmodel: "p/two"\n')
 
+    def fake_amp(self, report: str, exit_code: int = 0) -> Path:
+        """An `amp` whose `check-access` prints `report`, exits `exit_code`, and records its arguments."""
+        calls = self.root / "amp-calls"
+        self.fake(
+            "amp",
+            f'if [ "$1" = config ]; then echo "$*" >> {calls}; echo \'{report}\'; exit {exit_code}; fi\necho amp review',
+        )
+        return calls
+
+    def no_credits_review(self, reviewers: str) -> subprocess.CompletedProcess[str]:
+        return self.review(env={"EXTERNAL_REVIEWERS": reviewers, "EXTERNAL_AGENTS_AMP_NO_CREDITS": "1"})
+
+    def test_amp_on_credits_is_unavailable_when_credits_are_forbidden(self) -> None:
+        routing = {"kind": "upstream-model-provider", "modelProviderID": "openai", "modelProviderName": "OpenAI"}
+        calls = self.fake_amp(json.dumps({"ok": True, "modelRouting": routing}))
+        self.fake("claude", "echo claude review")
+
+        result = self.no_credits_review("amp:openai/gpt | claude")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.output.read_text(), "reviewer: claude\nclaude review\n")
+        reason = (
+            "Amp credits would pay for openai/gpt (served by OpenAI), and EXTERNAL_AGENTS_AMP_NO_CREDITS forbids them"
+        )
+        self.assertIn(f"amp:openai/gpt: unavailable ({reason})", result.stderr)
+        self.assertIn(reason, self.output.with_suffix(".log").read_text())
+        self.assertEqual(calls.read_text(), "config model-providers check-access --provider-model openai/gpt\n")
+
+    def test_amp_is_unavailable_when_its_routing_check_fails(self) -> None:
+        self.fake("claude", "echo claude review")
+        cases = {
+            "failed inference": ('{"ok": false, "modelRouting": {"kind": "model-provider"}}', 1),
+            "routing not an object": ('{"ok": true, "modelRouting": "model-provider"}', 0),
+            "not JSON": ("Error: not logged in", 1),
+            "unknown routing": ('{"ok": true, "modelRouting": {"kind": "something-new"}}', 0),
+        }
+        for name, (report, exit_code) in cases.items():
+            with self.subTest(name):
+                self.fake_amp(report, exit_code)
+
+                result = self.no_credits_review("amp:openai/gpt | claude")
+
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(self.output.read_text(), "reviewer: claude\nclaude review\n")
+                self.assertIn("amp:openai/gpt: unavailable (its model routing check failed", result.stderr)
+
+    def test_amp_on_a_linked_provider_runs_when_credits_are_forbidden(self) -> None:
+        routing = {"kind": "model-provider", "modelProviderName": "my ChatGPT subscription"}
+        calls = self.fake_amp(json.dumps({"ok": True, "modelRouting": routing}))
+
+        result = self.no_credits_review("amp:openai/gpt@high")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.output.read_text(), "reviewer: amp:openai/gpt@high\namp review\n")
+        self.assertIn("--provider-model openai/gpt --reasoning-effort high\n", calls.read_text())
+
+    def test_amp_routing_is_not_checked_unless_credits_are_forbidden(self) -> None:
+        calls = self.fake_amp(json.dumps({"ok": True, "modelRouting": {"kind": "upstream-model-provider"}}))
+
+        result = self.review(env={"EXTERNAL_REVIEWERS": "amp:openai/gpt"})
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.output.read_text(), "reviewer: amp:openai/gpt\namp review\n")
+        self.assertFalse(calls.exists())
+
     def test_optional_slot_falls_back_and_may_end_without_a_review(self) -> None:
         self.fake("claude", "echo claude review")
         self.fake("opencode", 'echo "Error: model not found"; exit 1')
