@@ -31,6 +31,7 @@ import datetime as dt
 import json
 import os
 import platform
+import shlex
 import shutil
 import signal
 import subprocess
@@ -48,7 +49,7 @@ from .backends import (
     coder_hosts,
     parse_agent,
 )
-from .common import ENV_CODER, UsageError, credential_env, is_secret
+from .common import ENV_CODER, VCS_DIRS, UsageError, credential_env, is_secret
 from .proxy import Proxy
 
 HOME = Path.home()
@@ -267,14 +268,15 @@ def tracked_files(worktree: Path) -> set[str]:
 
 
 def masks(worktree: Path) -> tuple[list[Path], list[Path]]:
-    """Untracked secret-like files to cover with an empty file, and VCS directories to
-    cover with an empty tmpfs. Every file is walked, build output included; links are
-    neither followed nor masked, since their targets outside the tree are not visible."""
+    """Untracked secret-like files and nested VCS files, such as a submodule's `.git` file,
+    to cover with an empty read-only file, and VCS directories to cover with an empty
+    tmpfs. Every file is walked, build output included; links are neither followed nor
+    masked, since their targets outside the tree are not visible."""
     tracked = tracked_files(worktree)
     files, directories = [], []
     for root, subdirectories, names in os.walk(worktree):
         for name in list(subdirectories):
-            if name in (".git", ".jj"):
+            if name in VCS_DIRS:
                 directories.append(Path(root, name))
                 subdirectories.remove(name)
         for name in names:
@@ -282,9 +284,32 @@ def masks(worktree: Path) -> tuple[list[Path], list[Path]]:
             relative = path.relative_to(worktree)
             if path.is_symlink() or relative == Path(".git"):
                 continue
-            if is_secret(Path(name)) and relative.as_posix() not in tracked:
+            if name in VCS_DIRS or (is_secret(Path(name)) and relative.as_posix() not in tracked):
                 files.append(path)
     return sorted(files), sorted(directories)
+
+
+def submodule_paths(worktree: Path) -> list[str]:
+    """Paths of the worktree's submodules (gitlinks in its index)."""
+    result = subprocess.run(["git", "-C", str(worktree), "ls-files", "-s", "-z"], capture_output=True)
+    if result.returncode != 0:
+        return []
+    entries = (os.fsdecode(entry) for entry in result.stdout.split(b"\0") if entry)
+    return [entry.partition("\t")[2] for entry in entries if entry.startswith("160000 ")]
+
+
+def git_common_dir(worktree: Path) -> Path | None:
+    """The main repository's git directory, which holds the worktree's hooks and config."""
+    result = subprocess.run(
+        ["git", "-C", str(worktree), "rev-parse", "--path-format=absolute", "--git-common-dir"],
+        capture_output=True,
+        text=True,
+    )
+    return Path(result.stdout.strip()).resolve() if result.returncode == 0 and result.stdout.strip() else None
+
+
+def overlaps(a: Path, b: Path) -> bool:
+    return a.is_relative_to(b) or b.is_relative_to(a)
 
 
 def bwrap_args(
@@ -358,12 +383,15 @@ def prepare(state: Path, backend: str | None, python: str) -> Path:
         (run / "home" / relative).parent.mkdir(parents=True, exist_ok=True)
         (run / "home" / relative).write_text(content)
     (run / "empty").touch(mode=0o444)
-    (run / "tools/ask").write_text(f'#!/bin/sh\nexec {python} -I {TOOL_DIR}/ask.py "$@"\n')
+    (run / "tools/ask").write_text(f'#!/bin/sh\nexec {shlex.quote(python)} -I {TOOL_DIR}/ask.py "$@"\n')
     (run / "tools/ask").chmod(0o755)
     (run / "tools/ask.py").write_text(mailbox.ASK)
     (run / "tools/forward.py").write_text(FORWARDER)
-    (state / "latest").unlink(missing_ok=True)
-    (state / "latest").symlink_to(run.name)
+    # Replaced atomically, so a coordinator never finds the link missing between runs.
+    link = state / f".latest-{os.getpid()}"
+    link.unlink(missing_ok=True)
+    link.symlink_to(run.name)
+    os.replace(link, state / "latest")
     return run
 
 
@@ -400,6 +428,11 @@ def code(args: argparse.Namespace, command: list[str] | None) -> int:
         fail("run it on a git worktree (`git worktree add`), not a main checkout: the agent could plant hooks in .git")
     if not worktree.is_dir():
         fail(f"{worktree} is not a directory")
+    if submodules := submodule_paths(worktree):
+        # An uninitialised submodule is an empty directory the agent could `git init`, and
+        # an initialised one has a `.git` file it could repoint: either way the host's next
+        # `git status` would load configuration the agent wrote, such as core.fsmonitor.
+        fail(f"worktrees with submodules are not supported ({submodules[0]}); the agent could plant git config in them")
     if HOME.resolve().is_relative_to(worktree):
         fail(f"{worktree} contains the home directory")
     if command is None and (args.task is None or not args.task.is_file()):
@@ -409,27 +442,40 @@ def code(args: argparse.Namespace, command: list[str] | None) -> int:
         fail("the state dir must be outside the worktree, and not contain it")
     state.mkdir(parents=True, exist_ok=True)
     cpus = cpu_list(args.cpus)
+    if platform.machine() != "x86_64" and not args.no_seccomp:
+        fail(f"the seccomp filter supports x86_64 only; pass --no-seccomp to run on {platform.machine()} without it")
+    common_dir = git_common_dir(worktree)
 
     mounts = Mounts()
     python = python_for_forwarder(mounts)
     for name in args.preset:
         PRESETS[name](mounts, state, len(cpus) if cpus else None)
-    for path in args.ro:
-        mounts.add_ro(check_bind(path))
-    for path in args.rw:
-        real = check_bind(path)
-        if Path(real).is_relative_to(state) or state.is_relative_to(real):
-            fail(f"--rw {path} overlaps the state dir")
-        mounts.rw.append((real, real))
+    for option, paths in (("--ro", args.ro), ("--rw", args.rw)):
+        for path in paths:
+            real = check_bind(path)
+            # Even read-only, the state dir exposes the control socket, and connecting to a
+            # socket needs no write access: the agent could answer its own questions.
+            if overlaps(Path(real), state):
+                fail(f"{option} {path} overlaps the state dir")
+            if option == "--rw" and common_dir is not None and overlaps(Path(real), common_dir):
+                fail(f"--rw {path} overlaps the main repository's git dir {common_dir}, whose hooks run on the host")
+            if option == "--ro":
+                mounts.add_ro(real)
+            else:
+                mounts.rw.append((real, real))
+    requested_env = {}
     for pair in args.env:
         key, sep, value = pair.partition("=")
         if not sep or not key:
             fail(f"--env {pair!r} is not KEY=VALUE")
-        mounts.env[key] = value
+        requested_env[key] = value
 
     backend, model = parse_agent(spec, CODER_MODEL_REQUIRED) if spec else (None, None)
     defaults = coder_hosts(backend, model) if backend else ()
-    hosts = args.hosts.split(",") if args.hosts else [*defaults, *args.allow_host]
+    if args.hosts is not None:
+        hosts = [host.strip() for host in args.hosts.split(",") if host.strip()]
+    else:
+        hosts = [*defaults, *(host.strip() for host in args.allow_host if host.strip())]
     # A check command still gets the configured agent, so `-- <agent> --version` shows
     # whether it starts in the sandbox.
     if backend is not None:
@@ -438,12 +484,14 @@ def code(args: argparse.Namespace, command: list[str] | None) -> int:
             # The bound file may have another name, such as an npm package's `codex.js`.
             command = [executable, *command[1:]]
         mounts.credentials = [rel for rel in CODER_CREDENTIALS[backend] if (HOME / rel).is_file()]
-        mounts.env |= credential_env(backend) | coder_env(backend)
+        mounts.env |= credential_env(backend, model) | coder_env(backend)
+    # What the caller asked for explicitly wins over inherited and default variables.
+    mounts.env |= requested_env
     if command is None:
         assert backend is not None
-        if not hosts:
+        if not hosts and args.hosts is None:
             fail(f"no egress host is known for {spec}; name the provider's API host with --allow-host")
-        if not mounts.credentials and not credential_env(backend):
+        if not mounts.credentials and not credential_env(backend, model):
             print(f"warning: {backend} has no login file or credential variable; it may fail", file=sys.stderr)
         task = args.task.read_text()
         if not args.raw_task:
@@ -456,8 +504,6 @@ def code(args: argparse.Namespace, command: list[str] | None) -> int:
         (run / "home" / relative).touch()
     if platform.machine() == "x86_64":
         (run / "seccomp.bpf").write_bytes(seccomp.encode(seccomp.program()))
-    elif not args.no_seccomp:
-        fail(f"the seccomp filter supports x86_64 only; pass --no-seccomp to run on {platform.machine()} without it")
     # bwrap reads the filter from whatever descriptor it lands on (`--seccomp N`). Moving it to
     # a fixed number with dup2 failed with EBUSY whenever another thread was opening a file
     # into that number at the same moment.
@@ -486,6 +532,9 @@ def code(args: argparse.Namespace, command: list[str] | None) -> int:
                 child.wait()
             print(f"xagents: stopped after {args.timeout} s", file=sys.stderr)
             code = 124
+        if code < 0:
+            # Killed by a signal: report it the way a shell does.
+            code = 128 - code
     finally:
         if bpf is not None:
             os.close(bpf)
@@ -514,7 +563,9 @@ def add_parsers(commands: argparse._SubParsersAction) -> None:
     run.add_argument("--cpus", type=int, help="Pin to this many CPUs")
     run.add_argument("--timeout", type=float, default=7200)
     run.add_argument("--allow-host", action="append", default=[], help="Add an egress host (port 443)")
-    run.add_argument("--hosts", help="Comma-separated egress hosts, replacing the backend's defaults")
+    run.add_argument(
+        "--hosts", help="Comma-separated egress hosts, replacing the defaults and --allow-host; empty for none"
+    )
     run.add_argument("--log-hosts", action="store_true", help="Log every CONNECT target to stderr")
     run.add_argument("--preset", action="append", default=[], choices=sorted(PRESETS), help="Toolchain to expose")
     run.add_argument("--ro", action="append", default=[], help="Bind a path read-only at the same place")
@@ -537,5 +588,7 @@ def add_parsers(commands: argparse._SubParsersAction) -> None:
         description="Exit 0 when delivered; 4 when no run is active.",
     )
     reply.add_argument("--state", type=Path, required=True)
-    reply.add_argument("--to", type=int, help="The id `question` printed; refuse if that question is gone")
+    reply.add_argument(
+        "--to", help="The id `question` printed, such as run-...:3; refuse if that question or its run is gone"
+    )
     reply.add_argument("text")

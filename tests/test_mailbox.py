@@ -197,6 +197,10 @@ class Mailbox(unittest.TestCase):
         self.assertEqual(asker.returncode, 1)
         self.assertIn("the run is ending", err)
 
+    def test_a_question_request_with_a_non_numeric_timeout_gets_an_error(self) -> None:
+        with self.assertRaisesRegex(common.UsageError, "timeout must be a number"):
+            mailbox.request(self.state, {"op": "question", "wait": True, "timeout": "soon"})
+
     def test_a_malformed_control_request_gets_an_error(self) -> None:
         client = socket.socket(socket.AF_UNIX)
         self.addCleanup(client.close)

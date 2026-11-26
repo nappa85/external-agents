@@ -58,9 +58,10 @@ is not used: `claude` loads only user settings, and the wrapper removes `.codex/
 and `.vibe/` for `vibe`. The diff still shows changes to those files.
 
 The reviewer process receives only an allowlisted environment: basic variables such as
-`PATH`, `HOME`, locale, proxy, and CA settings, plus provider credential prefixes such as
-`OPENAI_`, `ANTHROPIC_`, and `MISTRAL_`. Only `amp` also receives `AMP_` variables. List
-any other variable a backend needs in `EXTERNAL_AGENTS_ENV_PASSTHROUGH`.
+`PATH`, `HOME`, locale, proxy, and CA settings, plus the credential prefixes of its own
+provider: `ANTHROPIC_` for `claude`, `OPENAI_` for `codex`, `AMP_` for `amp`, `MISTRAL_` for
+`vibe`, and the model's provider for `opencode`. List any other variable a backend needs in
+`EXTERNAL_AGENTS_ENV_PASSTHROUGH`.
 
 ## Amp without another CLI
 
@@ -170,7 +171,12 @@ and has an error line naming a provider failure, such as `Error: rate limit reac
 a review that merely discusses authorization or quotas is kept.
 
 `--idle-timeout` (default 300 s) kills a reviewer that prints nothing that long; it does
-not apply to `claude`, which prints only at the end. `vibe` prints an event for each
+not apply to `claude`, which prints only at the end. A model thinking hard can be silent
+for minutes, so the timeout doubles at `@high` and triples at `@xhigh` and `@max`, and the
+retry after a stall allows twice the silence again. An `amp` run that goes silent is
+checked on the server (`amp threads export`): while its turn is still in flight it gets up
+to two more idle periods, and a turn the server finished while the CLI printed nothing is
+taken as the review. `vibe` prints an event for each
 finished message and tool call. `amp` runs with `--stream-json`, so
 it prints an event per model turn and tool call, and a model request that hangs without
 failing trips the idle timeout instead of running into the total one. A paid reviewer

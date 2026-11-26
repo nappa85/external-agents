@@ -26,7 +26,9 @@ permission prompts off.
 - **Login.** The backend's login file is bound read-only at the same place in the
   fresh HOME: `~/.local/share/opencode/auth.json`, `~/.claude/.credentials.json`,
   `~/.codex/auth.json`, `~/.local/share/amp/secrets.json`, or `~/.vibe/.env`. Provider
-  credential variables (`OPENAI_*`, `ANTHROPIC_*`, `MISTRAL_*`, ...; `AMP_*` for amp) and the
+  credential variables of the backend's own provider only (`ANTHROPIC_*` for claude,
+  `OPENAI_*` for codex, `AMP_*` for amp, `MISTRAL_*` for vibe, the model's provider for
+  opencode; see `docs/cli.md`), `--env` values, which win over them, and the
   `EXTERNAL_AGENTS_ENV_PASSTHROUGH` names are passed too; every other variable is
   dropped. Because the login is read-only, a token refresh inside the sandbox is not
   saved: refresh your login on the host before a long run. The system keyring is out of
@@ -50,7 +52,8 @@ Default egress by backend:
 | `amp`      | ampcode.com                                                                                  |
 | `vibe`     | api.mistral.ai                                                                               |
 
-`--allow-host` adds a host, `--hosts a,b` replaces the list, and `--log-hosts` prints
+`--allow-host` adds a host, `--hosts a,b` replaces the list and every `--allow-host`
+(`--hosts ""` allows no host), and `--log-hosts` prints
 every `CONNECT` the agent makes, which is how to find a missing host. Refusals are
 always logged. opencode asks for `models.opencode.ai` and `registry.npmjs.org` at
 start, and Vibe for `chat.mistral.ai`; they are refused and both work without them.
@@ -91,7 +94,7 @@ in memory:
 | ------------------------------------- | --------------------------------------------------------------------------------------- |
 | `question --state <dir>`              | 0 and the oldest unanswered question on stdout, its id on stderr; 1 when none; 4 when no run is active |
 | `question --wait [--timeout S]`       | blocks until a question arrives (0), the timeout passes (1), or the run ends (4)          |
-| `answer --state <dir> [--to ID] TEXT` | answers the oldest question; with `--to`, only if it is question ID; 4 when no run is active |
+| `answer --state <dir> [--to ID] TEXT` | answers the oldest question; with `--to run-...:N`, only if it is still question N of that run; 4 when no run is active |
 
 Questions are answered oldest first. If the asker gives up or is killed, its question is
 withdrawn, which is why `answer --to` exists: it refuses when the question you read is

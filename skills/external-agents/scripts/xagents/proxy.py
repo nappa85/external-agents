@@ -5,45 +5,93 @@ name the same host, so an allowed CDN address cannot front another site.
 """
 
 import contextlib
-import os
 import selectors
 import socket
 import sys
 import threading
 import time
 
+from .common import bind_unix
+
+# The largest ClientHello the proxy reads before giving up on finding its server name.
+MAX_HELLO = 16384 + 5
+
+
+class Malformed(Exception):
+    pass
+
+
+class Reader:
+    """Reads length-prefixed TLS fields, refusing any that runs past its container."""
+
+    def __init__(self, data):
+        self.data, self.pos = data, 0
+
+    def take(self, size):
+        if self.pos + size > len(self.data):
+            raise Malformed
+        chunk = self.data[self.pos : self.pos + size]
+        self.pos += size
+        return chunk
+
+    def number(self, size):
+        return int.from_bytes(self.take(size), "big")
+
+    def vector(self, length_size):
+        return Reader(self.take(self.number(length_size)))
+
+    def done(self):
+        return self.pos == len(self.data)
+
+
+def handshake_bytes(data):
+    """The handshake bytes of the TLS records at the start of `data`, which may split one
+    handshake message across several records; None when a record is not a handshake."""
+    out, pos = b"", 0
+    while pos + 5 <= len(data):
+        if data[pos] != 0x16:
+            return None
+        size = int.from_bytes(data[pos + 3 : pos + 5], "big")
+        if pos + 5 + size > len(data):
+            break
+        out += data[pos + 5 : pos + 5 + size]
+        pos += 5 + size
+    return out
+
 
 def client_hello_sni(data):
-    """The server name in a TLS ClientHello, or None when `data` is not a complete
-    ClientHello with exactly one host_name entry."""
+    """The server name in a TLS ClientHello, or None when `data` is not a complete,
+    well-formed ClientHello with exactly one host_name entry. Every length is checked
+    against its container, and the ClientHello may span several records."""
     try:
-        if data[0] != 0x16 or data[5] != 0x01:
+        handshake = handshake_bytes(data)
+        if handshake is None or len(handshake) < 4 or handshake[0] != 0x01:
             return None
-        record = int.from_bytes(data[3:5], "big")
-        if len(data) < 5 + record:
+        hello = Reader(handshake[1:])
+        hello = hello.vector(3)
+        hello.take(2 + 32)  # version, random
+        hello.vector(1)  # session id
+        hello.vector(2)  # cipher suites
+        hello.vector(1)  # compression methods
+        extensions = hello.vector(2)
+        if not hello.done():
             return None
-        pos = 5 + 4 + 2 + 32  # record header, handshake header, version, random
-        pos += 1 + data[pos]  # session id
-        pos += 2 + int.from_bytes(data[pos : pos + 2], "big")  # cipher suites
-        pos += 1 + data[pos]  # compression methods
-        end = pos + 2 + int.from_bytes(data[pos : pos + 2], "big")
-        pos += 2
         names = []
-        while pos + 4 <= end:
-            kind = int.from_bytes(data[pos : pos + 2], "big")
-            size = int.from_bytes(data[pos + 2 : pos + 4], "big")
-            body = data[pos + 4 : pos + 4 + size]
-            if kind == 0:  # server_name
-                inner = 2
-                while inner + 3 <= len(body):
-                    name_type = body[inner]
-                    length = int.from_bytes(body[inner + 1 : inner + 3], "big")
-                    if name_type == 0:
-                        names.append(body[inner + 3 : inner + 3 + length].decode("ascii"))
-                    inner += 3 + length
-            pos += 4 + size
+        while not extensions.done():
+            kind = extensions.number(2)
+            body = extensions.vector(2)
+            if kind != 0:  # server_name
+                continue
+            entries = body.vector(2)
+            if not body.done():
+                return None
+            while not entries.done():
+                name_type = entries.number(1)
+                name = entries.vector(2)
+                if name_type == 0:
+                    names.append(name.data.decode("ascii"))
         return names[0].lower() if len(names) == 1 else None
-    except (IndexError, UnicodeDecodeError):
+    except (Malformed, UnicodeDecodeError):
         return None
 
 
@@ -62,15 +110,7 @@ class Proxy(threading.Thread):
         self.slots = threading.BoundedSemaphore(self.MAX_TUNNELS)
         self.hosts = {h.lower() for h in hosts}
         self.log_hosts = log_hosts
-        self.server = socket.socket(socket.AF_UNIX)
-        # A relative name keeps long state paths under the 108-byte socket path limit.
-        cwd = os.getcwd()
-        os.chdir(path.parent)
-        try:
-            self.server.bind(path.name)
-        finally:
-            os.chdir(cwd)
-        self.server.listen(64)
+        self.server = bind_unix(path, 64)
 
     def run(self):
         while True:
@@ -137,9 +177,11 @@ class Proxy(threading.Thread):
                 return
             target = parts[1]
             if self.log_hosts:
-                print(f"xagents-proxy: CONNECT {target}", file=sys.stderr)
+                print(f"xagents-proxy: CONNECT {target!r}", file=sys.stderr)
             if not self.allowed(target):
-                print(f"xagents-proxy: refused {target}", file=sys.stderr)
+                # repr: the target is the agent's text, which must not write control
+                # characters into the coordinator's terminal or log.
+                print(f"xagents-proxy: refused {target!r}", file=sys.stderr)
                 client.sendall(b"HTTP/1.1 403 Forbidden\r\n\r\n")
                 return
             host = target.rpartition(":")[0].lower()
@@ -147,14 +189,14 @@ class Proxy(threading.Thread):
             client.sendall(b"HTTP/1.1 200 Connection established\r\n\r\n")
             hello = rest
             deadline = time.monotonic() + self.HEADER_SECONDS
-            while client_hello_sni(hello) is None and len(hello) < 16384 + 5:
+            while client_hello_sni(hello) is None and len(hello) < MAX_HELLO:
                 chunk = self.receive(client, deadline)
                 if not chunk:
                     return
                 hello += chunk
             if client_hello_sni(hello) != host:
                 print(
-                    f"xagents-proxy: refused TLS name {client_hello_sni(hello)} in {target}",
+                    f"xagents-proxy: refused TLS name {client_hello_sni(hello)!r} in {target!r}",
                     file=sys.stderr,
                 )
                 return

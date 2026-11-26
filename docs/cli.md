@@ -20,9 +20,11 @@ python3 -I skills/external-agents/scripts/external_agents.py <command> [options]
 | `XDG_STATE_HOME`                  | `review`          | where the free-tier ledger lives (default `~/.local/state`)                   |
 
 Agents otherwise receive only basic variables (`PATH`, `HOME`, locale, proxy, CA
-settings) and provider credentials (`OPENAI_*`, `ANTHROPIC_*`, `CLAUDE_*`, `CODEX_*`,
-`OPENCODE_*`, `OPENROUTER_*`, `AWS_*`, `GOOGLE_*`, `GEMINI_*`, `VERTEX_*`, `AZURE_*`,
-`MISTRAL_*`, and `AMP_*` for amp only).
+settings) and the backend's own provider credentials: `ANTHROPIC_*` and `CLAUDE_*` for claude, plus
+the `AWS_*`, `GOOGLE_*`, `VERTEX_*`, `CLOUD_ML_*` and `AZURE_*` platforms that serve Claude;
+`OPENAI_*`, `CODEX_*` and `AZURE_*` for codex; `AMP_*` for amp; `MISTRAL_*` for vibe; and for
+opencode `OPENCODE_*` plus the prefixes of the model's provider, such as `OPENAI_*` for
+`openai/...`. No agent receives another provider's keys.
 
 ## Backends and models
 
@@ -100,7 +102,7 @@ Runs the panel on a snapshot of a Git checkout.
 | `--reviewer AGENT`        | override with one slot; repeat for fallbacks                                    |
 | `--expect REGEX`          | a review must match, or it counts as incomplete and the next reviewer runs      |
 | `--timeout S`             | per-attempt limit (default 1800)                                                |
-| `--idle-timeout S`        | kill after S seconds of silence (default 300; not for `claude`)                 |
+| `--idle-timeout S`        | kill after S seconds of silence (default 300, ×2 at `@high`, ×3 above; not `claude`) |
 | `--no-preflight`          | skip the "Reply with exactly: PONG" check before each reviewer                  |
 
 The snapshot also holds `REVIEW_FILES.txt`, the changed paths with a status letter
@@ -123,7 +125,7 @@ of the agent, to check it: `-- <backend> --version` checks that the agent starts
 | `--raw-task`       | send the task without the preamble                                          |
 | `--agent AGENT`    | override `EXTERNAL_CODER`                                                   |
 | `--allow-host H`   | add an egress host (port 443); repeatable                                   |
-| `--hosts H,H`      | replace the backend's default egress hosts                                  |
+| `--hosts H,H`      | replace the default hosts and `--allow-host`; `--hosts ""` allows none      |
 | `--log-hosts`      | log every `CONNECT` the agent makes                                         |
 | `--preset rust`    | expose the Rust toolchain and Cargo caches; offline builds                  |
 | `--ro PATH`        | bind a path read-only at the same place; repeatable                         |
@@ -145,7 +147,9 @@ or the run ended during `--wait`.
 
 ## `answer --state DIR [--to ID] TEXT`
 
-Answers the oldest question. With `--to`, only if it is still question `ID`.
+Answers the oldest question. With `--to`, only if it is still question `ID`; `ID` is the
+`run-...:N` token that `question` prints, so an answer meant for an earlier run is refused
+once a newer run starts. A bare `N` is accepted and checks only the number.
 
 Exit: 0 delivered; 2 nothing waiting, or `ID` is no longer the oldest; 4 no active run.
 

@@ -135,7 +135,7 @@ askers with an error and waiting `question --wait` calls with exit 4.
 **Defended against:** an agent, or instructions injected into the code it reads, trying
 to read secrets outside the worktree, read untracked secret files inside it, reach hosts
 other than its model API, reach host or LAN services, tamper with the host's git
-metadata, plant files the host later opens while handling questions, or persist beyond
+metadata (a worktree with submodules is refused, since their `.git` paths are writable), plant files the host later opens while handling questions, or persist beyond
 the run.
 
 **Not defended against:**

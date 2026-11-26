@@ -688,18 +688,21 @@ class ReviewerSelectionTests(Sandbox):
         self.assertIn("cannot use --output-dir", result.stderr)
 
     def test_reviewer_environment_drops_unrelated_credentials(self) -> None:
+        # A backend receives its own provider's credentials, never another provider's.
         self.fake(
             "claude",
-            'echo "github=${GITHUB_TOKEN:-unset} ssh=${SSH_AUTH_SOCK:-unset} openai=${OPENAI_API_KEY:-unset}'
+            'echo "anthropic=${ANTHROPIC_API_KEY:-unset} github=${GITHUB_TOKEN:-unset} ssh=${SSH_AUTH_SOCK:-unset} openai=${OPENAI_API_KEY:-unset}'
             ' amp=${AMP_API_KEY:-unset} lang=${LANG:-unset}"',
         )
         env = {"GITHUB_TOKEN": "gh", "SSH_AUTH_SOCK": "/agent", "OPENAI_API_KEY": "sk", "AMP_API_KEY": "amp"}
+        env["ANTHROPIC_API_KEY"] = "ak"
 
         result = self.review(env={**env, "LANG": "C.UTF-8"})
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(
-            self.output.read_text(), "reviewer: claude\ngithub=unset ssh=unset openai=sk amp=unset lang=C.UTF-8\n"
+            self.output.read_text(),
+            "reviewer: claude\nanthropic=ak github=unset ssh=unset openai=unset amp=unset lang=C.UTF-8\n",
         )
 
     def test_amp_reviewer_runs_only_the_generated_confined_mode(self) -> None:
@@ -872,6 +875,51 @@ class FreeTierAndCompletenessTests(Sandbox):
         self.assertEqual(review.classify(124, "partial\n[killed: idle timeout]"), "stalled")
         self.assertEqual(review.classify(124, "partial\n[killed: total timeout]"), "timed out")
 
+    def test_a_silent_amp_run_still_working_on_the_server_is_not_stalled(self) -> None:
+        # A model thinking at length prints nothing; the Amp server shows its turn in flight,
+        # and then its answer, which is taken even though the CLI never printed it.
+        exports = self.root / "exports"
+        working = {"messages": [{"role": "user", "content": [{"type": "text", "text": "review"}]}]}
+        answered = {
+            "messages": [
+                {"role": "user", "content": [{"type": "text", "text": "review"}]},
+                {
+                    "role": "assistant",
+                    "state": {"type": "complete", "stopReason": "end_turn"},
+                    "content": [{"type": "thinking", "thinking": "..."}, {"type": "text", "text": "VERDICT: ready"}],
+                },
+            ]
+        }
+        working_file, answered_file = self.root / "working.json", self.root / "answered.json"
+        working_file.write_text(json.dumps(working))
+        answered_file.write_text(json.dumps(answered))
+        init = json.dumps({"type": "system", "subtype": "init", "session_id": "T-1"})
+        self.fake(
+            "amp",
+            f'if [ "$1" = threads ]; then echo x >> {exports}; n=$(grep -c . {exports})\n'
+            f'  if [ "$n" -lt 2 ]; then cat {working_file}; else cat {answered_file}; fi\n'
+            f"  exit 0\nfi\necho '{init}'\nsleep 30",
+        )
+
+        result = self.panel("amp:p/model", "--expect", "(?i)verdict")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.output.read_text(), "reviewer: amp:p/model\nVERDICT: ready")
+        self.assertNotIn("stalled", result.stderr)
+        log = self.output.with_suffix(".log").read_text()
+        self.assertIn("T-1 is still working on the server", log)
+
+    def test_a_high_effort_reviewer_may_stay_silent_longer(self) -> None:
+        # No server to ask: the idle timeout itself grows with the effort.
+        self.fake("opencode", "sleep 1.5; echo review")
+
+        medium = self.panel("opencode:p/model@medium")
+        high = self.panel("opencode:p/model@high")
+
+        self.assertIn("opencode:p/model@medium: stalled", medium.stderr)
+        self.assertEqual(high.returncode, 0, high.stderr)
+        self.assertEqual(self.output.read_text(), "reviewer: opencode:p/model@high\nreview\n")
+
     def test_a_stalled_amp_reviewer_is_retried_once_and_its_trace_kept(self) -> None:
         # `amp --stream-json` events; the run stalls after its first tool call while the
         # counter file holds a positive number.
@@ -889,6 +937,8 @@ class FreeTierAndCompletenessTests(Sandbox):
         counter = self.root / "stalls"
         self.fake(
             "amp",
+            # `amp threads export` fails, so the server cannot vouch for the silent run.
+            f'[ "$1" = threads ] && exit 1\n'
             f"echo 'Warning: deprecated' >&2\ncat {self.root / 'start'}\nn=$(cat {counter})\n"
             f'if [ "$n" -gt 0 ]; then echo $((n - 1)) > {counter}; sleep 30; fi\ncat {self.root / "end"}',
         )

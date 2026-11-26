@@ -33,10 +33,13 @@ from xagents.common import ENV_CODER, ENV_REVIEWERS, UsageError, installed  # no
 
 
 def bubblewrap_works() -> bool:
-    """Whether bwrap can create its namespaces here; containers and some kernels forbid it."""
+    """Whether bwrap can create the sandbox `code` asks for here; containers, some kernels
+    and bubblewrap releases older than 0.8 (no --disable-userns) cannot."""
     if not installed("bwrap"):
         return False
-    probe = ["bwrap", "--unshare-all", "--ro-bind", "/", "/", "true"]
+    probe = [
+        "bwrap", "--unshare-all", "--unshare-user", "--disable-userns", "--clearenv", "--ro-bind", "/", "/", "true",
+    ]  # fmt: skip
     return subprocess.run(probe, capture_output=True).returncode == 0
 
 

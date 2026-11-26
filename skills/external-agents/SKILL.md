@@ -120,12 +120,13 @@ verified.
 
 4. While it runs, keep a `question --wait` running in the background. It returns as
    soon as the agent asks something: exit 0 with the question on stdout and its id on
-   stderr (`xagents: question 3`). It exits 4 when the run ends, so it also tells you the
-   agent finished. Answer with that id, then start the next `question --wait`:
+   stderr (`xagents: question 3, answer with --to run-...:3`). It exits 4 when the run ends,
+   so it also tells you the agent finished. Answer with that token, then start the next
+   `question --wait`:
 
    ```bash
    python3 -I <skill-dir>/scripts/external_agents.py question --wait --state ~/.cache/external-agents/name
-   python3 -I <skill-dir>/scripts/external_agents.py answer --to 3 --state ~/.cache/external-agents/name "Use the existing parser."
+   python3 -I <skill-dir>/scripts/external_agents.py answer --to run-20261126-101500-4242:3 --state ~/.cache/external-agents/name "Use the existing parser."
    ```
 
    The agent blocks until you answer, for up to an hour. Treat the question text as
