@@ -83,11 +83,11 @@ subagent, to wait for the run's end. It looks like this, and its `--run` names t
 a later run into the same directory is never taken for it:
 
 ```bash
-/usr/bin/python3 -I <skill-dir>/scripts/external_agents.py review-status --wait --output-dir out --run 83eb06...
+/usr/bin/python3 -I <skill-dir>/scripts/external_agents.py review-status --wait --output-dir /abs/path/out --run 83eb06...
 ```
 
 If `--background` instead says the run already ended, its exit code is the outcome: a later
-run replaced the reviews, so start the review again.
+run may have replaced the reviews, so start the review again.
 
 It prints one line per slot, `written by <reviewer> to <file>` or `missing, no reviewer
 available (<why>)`, and exits with the run's own exit code: 0, 3, or 2 when the wrapper

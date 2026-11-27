@@ -1260,6 +1260,7 @@ class ReviewStatusTests(Sandbox):
         status = {"state": "running", "run": "b" * 32, "slots": [slot]}
         (self.out / "review-status.json").write_text(json.dumps(status))
         with review.status.hold(self.out / "review-1.log"):
+            began = time.monotonic()
             result = subprocess.run(
                 [sys.executable, str(SCRIPT), "review-status", "--output-dir", str(self.out), "--wait",
                  "--timeout", "0.5"],
@@ -1268,6 +1269,8 @@ class ReviewStatusTests(Sandbox):
 
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
         self.assertIn("review starting", result.stdout)
+        # It waited for the timeout instead of giving up at once.
+        self.assertGreaterEqual(time.monotonic() - began, 0.4)
 
     def test_a_running_run_holds_a_lock_of_its_own_until_its_last_status(self) -> None:
         self.assertEqual(self.start("amp:p/slow").returncode, 0)
@@ -1301,6 +1304,22 @@ class ReviewStatusTests(Sandbox):
 
         self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
         self.assertIn(f"to {self.repo / 'reviews' / 'review-1.md'}", done.stdout)
+
+    def test_the_printed_command_for_an_output_file_works_from_another_directory(self) -> None:
+        self.release.touch()
+        (self.repo / "reviews").mkdir()
+        started = self.run_script(
+            "review", "--prompt-file", str(self.prompt), "--output", "reviews/x.md", "--no-preflight",
+            "--reviewers", "amp:p/fast", "--background", env=self.env,
+        )  # fmt: skip
+        self.assertEqual(started.returncode, 0, started.stdout + started.stderr)
+        printed = started.stdout.split("wait for it with: ", 1)[1].strip()
+
+        done = subprocess.run(
+            [*shlex.split(printed), "--timeout", "30"], cwd=self.root, capture_output=True, text=True, env=self.env
+        )
+
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
 
     @unittest.skipIf(os.geteuid() == 0, "root traverses any directory")
     def test_an_untraversable_output_directory_counts_as_no_run(self) -> None:
@@ -1337,6 +1356,9 @@ class ReviewStatusTests(Sandbox):
             "summary.status.json",
             "Review-2.md",
             "notes.run.md",
+            "notes.RUN.md",
+            "notes.status.md",
+            "x\n.run.md",
             "review.LOG",
         ):
             with self.subTest(name=name):

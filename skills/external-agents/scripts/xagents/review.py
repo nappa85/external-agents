@@ -828,9 +828,15 @@ def output_paths(args: argparse.Namespace, count: int) -> list[Path]:
             raise UsageError(f"the panel has {count} slots; pass --output-dir instead of --output")
         # Case-insensitive file systems, such as macOS's, treat Review-1.md as review-1.md;
         # `x.run.md` would use `x.run.log`, the run log of `--output x.md`.
-        if re.fullmatch(r"review-(\d+|status|run)|.*\.(run|status)", args.output.stem, re.IGNORECASE):
+        stem = args.output.stem.lower()
+        if re.fullmatch(r"review-(\d+|status|run)", stem):
             raise UsageError(
                 f"--output {args.output}: names like review-1.md are --output-dir's files; pick another name"
+            )
+        if stem.endswith((".run", ".status")):
+            raise UsageError(
+                f"--output {args.output}: the wrapper writes <stem>.run.log and <stem>.status.json for other "
+                "outputs; pick a stem that does not end in .run or .status"
             )
         if not args.output.parent.is_dir():
             raise UsageError(f"cannot use --output {args.output}: {args.output.parent} is not a directory")
