@@ -23,6 +23,7 @@ import subprocess
 import sys
 import threading
 import time
+import uuid
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -33,7 +34,9 @@ RUNNING, FINISHED = "running", "finished"
 EXIT_RUNNING = 1
 EXIT_NO_RUN = 4
 POLL = 1.0
-# Set in the detached run, so it runs the review instead of detaching again.
+# Set in the detached run to an ID that `--background` chose for it. The run records it in
+# its status, so `--background` never takes an earlier run's status, even one whose pid the
+# system reused, for this run's; and the run does not detach again.
 ENV_DETACHED = "XAGENTS_DETACHED_REVIEW"
 
 
@@ -111,7 +114,14 @@ def read(path: Path) -> dict | None:
     if not isinstance(status, dict):
         return None
     slots = status.get("slots", [])
-    return status if isinstance(slots, list) and all(isinstance(slot, dict) for slot in slots) else None
+    if not isinstance(slots, list) or not all(isinstance(slot, dict) for slot in slots):
+        return None
+    for slot in slots:
+        for field in ("chain", "reasons"):
+            value = slot.get(field) or []
+            if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+                return None
+    return status
 
 
 class Tracker:
@@ -123,6 +133,7 @@ class Tracker:
         self.status: dict = {
             "state": RUNNING,
             "pid": os.getpid(),
+            "run": os.environ.get(ENV_DETACHED),
             "started": _now(),
             "slots": [{"slot": number, **slot, "state": RUNNING} for number, slot in enumerate(slots, start=1)],
         }
@@ -210,16 +221,17 @@ def background(script: Path, argv: list[str], output: Path | None, output_dir: P
     except OSError as error:
         raise UsageError(f"cannot use --output-dir {output_dir}: {error}") from error
     log = run_log_path(output, output_dir)
-    # The run replaces an earlier run's status under its lock; one with another pid is
+    # The run replaces an earlier run's status under its lock; one without this run's ID is
     # never taken for this run's.
     path = status_path(output, output_dir)
+    run = uuid.uuid4().hex
     with log.open("w") as out:
         child = subprocess.Popen(
             [sys.executable, "-I", str(script), *argv],
             stdin=subprocess.DEVNULL,
             stdout=out,
             stderr=subprocess.STDOUT,
-            env={**os.environ, ENV_DETACHED: "1"},
+            env={**os.environ, ENV_DETACHED: run},
             start_new_session=True,
         )
     while True:
@@ -227,7 +239,7 @@ def background(script: Path, argv: list[str], output: Path | None, output_dir: P
         # between two polls started, and its outcome is for `review-status`.
         ended = child.poll() is not None
         status = read(path)
-        if status is not None and status.get("pid") == child.pid:
+        if status is not None and status.get("run") == run:
             where = f"--output {output}" if output is not None else f"--output-dir {output_dir}"
             print(f"review started in the background (pid {child.pid}); its own output goes to {log}")
             print(f"wait for it with: {script.name} review-status --wait {where}")

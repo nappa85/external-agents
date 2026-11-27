@@ -1123,7 +1123,8 @@ class ReviewStatusTests(Sandbox):
         script.write_text(
             "import json, os, sys\n"
             "out = sys.argv[-1]\n"
-            "open(os.path.join(out, 'review-status.json'), 'w').write(json.dumps({'pid': os.getpid()}))\n"
+            "run = os.environ['XAGENTS_DETACHED_REVIEW']\n"
+            "open(os.path.join(out, 'review-status.json'), 'w').write(json.dumps({'pid': os.getpid(), 'run': run}))\n"
             "sys.exit(3)\n"
         )
         real_sleep = time.sleep
@@ -1132,14 +1133,32 @@ class ReviewStatusTests(Sandbox):
 
         self.assertEqual(code, 0)
 
+    def test_a_status_with_this_runs_pid_but_not_its_id_is_not_taken_as_started(self) -> None:
+        # As if the system reused an earlier run's pid: the old status names this child's
+        # pid, and the child then fails before it records its own run.
+        script = self.root / "failed_start.py"
+        script.write_text(
+            "import json, os, sys, time\n"
+            "out = sys.argv[-1]\n"
+            "open(os.path.join(out, 'review-status.json'), 'w').write(json.dumps({'pid': os.getpid(), 'run': 'old'}))\n"
+            "time.sleep(0.5)\n"
+            "sys.exit(2)\n"
+        )
+        with mock.patch("sys.stdout"), mock.patch("sys.stderr"):
+            code = review.status.background(script, [str(self.out)], None, self.out)
+
+        self.assertEqual(code, 2)
+
     def test_a_malformed_status_counts_as_no_run(self) -> None:
         self.out.mkdir()
-        (self.out / "review-status.json").write_text(json.dumps({"state": "running", "slots": 5}))
+        for slots in (5, [5], [{"chain": 5}], [{"state": "missing", "reasons": [5]}]):
+            with self.subTest(slots=slots):
+                (self.out / "review-status.json").write_text(json.dumps({"state": "finished", "slots": slots}))
 
-        result = self.status()
+                result = self.status()
 
-        self.assertEqual(result.returncode, 4, result.stdout + result.stderr)
-        self.assertNotIn("Traceback", result.stderr)
+                self.assertEqual(result.returncode, 4, result.stdout + result.stderr)
+                self.assertNotIn("Traceback", result.stderr)
 
     def test_a_foreground_run_with_output_records_its_status_next_to_it(self) -> None:
         self.release.touch()
