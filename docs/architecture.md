@@ -34,7 +34,8 @@ skills/external-agents/scripts/
    file-tools-only configuration: `claude -p` with `Read,Glob,Grep,Edit,Write`,
    `dontAsk`, and edits allowed only under the snapshot; a generated opencode agent with
    a deny-by-default permission list and `external_directory: deny`; a generated Amp
-   plugin mode with three file tools and path-matching permission rules; `vibe` with
+   plugin mode with three file tools and a `tool.call` hook that rejects any call outside
+   the snapshot, links resolved, and any write to `.amp/`; `vibe` with
    the `accept-edits` policy, `outside_workdir = "deny"`, shell, web and subagent tools
    set to `never`, and those settings passed as `VIBE_*` variables, which override the
    user's config; `codex exec --sandbox workspace-write`.

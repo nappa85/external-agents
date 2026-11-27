@@ -42,7 +42,7 @@ repeatable, overrides it with one slot that tries those reviewers in order.
 | `codex`    | `codex exec --sandbox workspace-write`                                                          |
 | `claude`   | `claude -p` with only file tools, `dontAsk` permissions, and edits allowed only in the snapshot |
 | `opencode` | a generated `reviewer` agent with only file tools, and `external_directory` denied              |
-| `amp`      | a generated `external-reviewer` mode with only file tools, permissions limited to the snapshot  |
+| `amp`      | a generated `external-reviewer` mode with file tools that a plugin hook keeps in the snapshot   |
 | `vibe`     | `accept-edits` policy, `outside_workdir = "deny"`, shell, web, and subagent tools refused        |
 
 The snapshot prevents accidental exposure and edits. It is not a sandbox against a

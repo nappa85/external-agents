@@ -8,6 +8,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- The `amp` reviewer's confinement no longer relies on `amp.permissions` rules, which Amp
+  removes on 2026-12-04. The generated plugin's `tool.call` hook allows only its file tools,
+  on absolute paths whose real location, links resolved, is inside the snapshot. It also
+  refuses writes to `.amp/`, so the reviewer cannot rewrite the hook.
 - A `codex` reviewer could write the configuration of the repository that records its
   changes, next to its snapshot in `/tmp`, and make the wrapper's own `git` run commands on
   the host (`core.fsmonitor`, filter drivers). The repository now lives under the state

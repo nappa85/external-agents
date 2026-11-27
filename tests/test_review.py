@@ -778,7 +778,7 @@ class ReviewerSelectionTests(Sandbox):
             "amp",
             'echo "amp=${AMP_API_KEY:-unset} github=${GITHUB_TOKEN:-unset}"; ls .amp/plugins; '
             'grep -o "model: .*" .amp/plugins/external-reviewer.ts; '
-            'grep -c \'"action": "reject"\' .amp/settings.json; echo "$@"',
+            'echo "settings=$(cat .amp/settings.json)"; echo "$@"',
         )
 
         result = self.review("--reviewer", "amp:openai/gpt-6.1-sol", env={"AMP_API_KEY": "amp", "GITHUB_TOKEN": "gh"})
@@ -792,7 +792,7 @@ class ReviewerSelectionTests(Sandbox):
                 "amp=amp github=unset",
                 "external-reviewer.ts",
                 'model: "openai/gpt-6.1-sol",',
-                "4",
+                "settings={}",
             ],
         )
         self.assertRegex(lines[5], r"--settings-file \S+/snapshot/\.amp/settings\.json --mode external-reviewer ")
@@ -811,6 +811,65 @@ class ReviewerSelectionTests(Sandbox):
                 '\t\treasoningEffort: "high",',
             ],
         )
+
+    @unittest.skipUnless(shutil.which("node"), "needs node")
+    def test_amp_reviewer_plugin_confines_file_tools_to_the_snapshot(self) -> None:
+        # Amp drops `amp.permissions` rules, so the generated plugin's tool.call hook must
+        # decide every call. This runs that hook under node with a stand-in plugin API.
+        snap = self.root / "snapshot"
+        outside = self.root / "outside"
+        (snap / "src").mkdir(parents=True)
+        outside.mkdir()
+        (snap / "src/lib.rs").write_text("fn old() {}\n")
+        (outside / "secret.txt").write_text("secret\n")
+        (self.root / "snapshot-sibling").mkdir()
+        (snap / "link.txt").symlink_to(outside / "secret.txt")
+        (snap / "linked-dir").symlink_to(outside)
+        (snap / "dangling.txt").symlink_to(outside / "planted.txt")
+        review.Reviewer("amp", "p/model").prepare(snap)
+        plugin = self.root / "plugin.mjs"
+        shutil.copyfile(snap / ".amp/plugins/external-reviewer.ts", plugin)
+        calls = [
+            ("Read", f"{snap}/src/lib.rs", "allow"),
+            ("Read", str(snap), "allow"),
+            ("Read", f"{snap}/.amp/settings.json", "allow"),
+            ("create_file", f"{snap}/tests/new/test_bug.rs", "allow"),
+            ("edit_file", f"{snap}/src/lib.rs", "allow"),
+            ("Read", f"{outside}/secret.txt", "reject"),
+            ("Read", f"{snap}-sibling", "reject"),
+            ("Read", "src/lib.rs", "reject"),
+            ("Read", f"{snap}/src/../../outside/secret.txt", "reject"),
+            ("Read", f"{snap}/missing/../link.txt", "reject"),
+            ("Read", f"{snap}/link.txt", "reject"),
+            ("Read", f"{snap}/linked-dir/secret.txt", "reject"),
+            ("create_file", f"{snap}/linked-dir/new.txt", "reject"),
+            ("create_file", f"{snap}/dangling.txt", "reject"),
+            ("edit_file", f"{snap}/.amp/plugins/external-reviewer.ts", "reject"),
+            ("create_file", f"{snap}/.amp/settings.json", "reject"),
+            ("shell_command", f"{snap}/src/lib.rs", "reject"),
+            ("Read", None, "reject"),
+        ]
+        driver = (
+            "const handlers = {};\n"
+            "const amp = { createAgent: () => ({ definition: {} }), registerAgentMode() {},"
+            " on(name, handler) { handlers[name] = handler } };\n"
+            f"(await import({json.dumps(plugin.as_uri())})).default(amp);\n"
+            "for (const [tool, path] of JSON.parse(process.argv[1])) {\n"
+            "  const input = path === null ? {} : { path };\n"
+            "  const result = await handlers['tool.call']({ toolUseID: 't', tool, input, thread: { id: 'T' } });\n"
+            "  console.log(result.action);\n"
+            "}\n"
+        )
+        result = subprocess.run(
+            ["node", "--input-type=module", "-e", driver, json.dumps([[tool, path] for tool, path, _ in calls])],
+            capture_output=True,
+            text=True,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        actions = [{"reject-and-continue": "reject"}.get(action, action) for action in result.stdout.split()]
+        self.assertEqual(len(actions), len(calls), result.stdout)
+        self.assertEqual([(tool, path, action) for (tool, path, _), action in zip(calls, actions, strict=True)], calls)
 
     def test_vibe_reviewer_runs_confined_without_the_repository_config(self) -> None:
         self.write(".vibe/tools/repo_tool.py", "import os\n")

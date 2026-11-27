@@ -94,21 +94,78 @@ OPENCODE_REVIEWER = {
 AMP_MODE = "external-reviewer"
 # A project plugin that registers a mode whose agent can only read, create, and edit
 # files. Amp offers no grep or glob tool to plugin agents; Read also lists directories.
-# apply_patch is left out because its paths are inside the patch text, where
-# permission rules cannot match them.
-AMP_FILE_TOOLS = ("Read", "create_file", "edit_file")
+# apply_patch is left out because its paths are inside the patch text.
+#
+# Amp is removing `amp.permissions` rules, so the plugin's tool.call hook decides every
+# call: it allows the three file tools on an absolute path whose real location, links
+# resolved, is inside the snapshot, and rejects everything else. Writes to `.amp/` are
+# rejected so the reviewer cannot rewrite this plugin. A plugin that fails to load also
+# leaves no reviewer mode, so the run fails instead of going unchecked. The file is plain
+# JavaScript so tests can run the hook under node. The `__NAME__` placeholders are filled
+# in when the plugin is written.
 AMP_PLUGIN = """\
-// @amp-agent-mode {{"key": "{mode}", "label": "{mode}"}}
-import type {{ PluginAPI }} from '@ampcode/plugin'
+// @amp-agent-mode {"key": "__MODE__", "label": "__MODE__"}
+import { lstatSync, realpathSync } from 'node:fs'
+import path from 'node:path'
 
-export default function (amp: PluginAPI) {{
-	const agent = amp.createAgent({{
-		model: {model},
-		tools: {{ include: ['Read', 'create_file', 'edit_file'], exclude: ['tool_search', 'code_exec'] }},{effort}
+const ROOT = realpathSync.native(__ROOT__)
+const CONFIG = path.join(ROOT, '.amp')
+const FILE_TOOLS = new Set(['Read', 'create_file', 'edit_file'])
+
+function within(dir, target) {
+	return target === dir || target.startsWith(dir + path.sep)
+}
+
+// Where `target` really is: the real path of its deepest existing ancestor plus the
+// components that do not exist yet. Any other failure, such as a dangling link that a
+// write would follow, gives null.
+function realLocation(target) {
+	const missing = []
+	for (let head = target; ; ) {
+		try {
+			return path.join(realpathSync.native(head), ...missing)
+		} catch (error) {
+			if (error.code !== 'ENOENT') return null
+		}
+		try {
+			lstatSync(head)
+			return null
+		} catch {}
+		const parent = path.dirname(head)
+		if (parent === head) return null
+		missing.unshift(path.basename(head))
+		head = parent
+	}
+}
+
+function refusal(event) {
+	if (!FILE_TOOLS.has(event.tool)) return 'Only Read, create_file and edit_file are available.'
+	const target = event.input.path
+	if (typeof target !== 'string' || !path.isAbsolute(target)) return 'Use an absolute path.'
+	if (target.split(path.sep).includes('..')) return 'Paths must not contain `..`.'
+	const real = realLocation(target)
+	if (real === null || !within(ROOT, real)) return `Stay inside ${ROOT}.`
+	if (event.tool !== 'Read' && within(CONFIG, real)) return 'The .amp directory is read-only.'
+	return null
+}
+
+export default function (amp) {
+	const agent = amp.createAgent({
+		model: __MODEL__,
+		tools: { include: [...FILE_TOOLS], exclude: ['tool_search', 'code_exec'] },__EFFORT__
 		instructions: 'You are a reviewer. You can read and change files in your working directory but cannot run commands.',
-	}})
-	amp.registerAgentMode({{ key: '{mode}', label: '{mode}', agent: agent.definition }})
-}}
+	})
+	amp.registerAgentMode({ key: '__MODE__', label: '__MODE__', agent: agent.definition })
+	amp.on('tool.call', async (event) => {
+		let message
+		try {
+			message = refusal(event)
+		} catch {
+			message = 'The path could not be checked.'
+		}
+		return message === null ? { action: 'allow' } : { action: 'reject-and-continue', message }
+	})
+}
 """
 
 # Vibe reads `VIBE_<SETTING>` variables over the user's and the project's config, so these
@@ -136,18 +193,6 @@ def snapshot_roots(snap: Path) -> list[str]:
     """Both spellings of the snapshot path: a temporary directory can sit behind a symlink,
     such as `/var` on macOS."""
     return list(dict.fromkeys((str(snap.absolute()), str(snap.resolve()))))
-
-
-def amp_settings(snap: Path) -> dict[str, object]:
-    """Permissions that allow the file tools inside the snapshot and reject every other call.
-
-    Amp matches the path before normalizing it, so `..` segments are rejected first."""
-    paths = [pattern for root in snapshot_roots(snap) for pattern in (root, f"{root}/*")]
-    rules: list[dict[str, object]] = []
-    for tool in AMP_FILE_TOOLS:
-        rules.append({"tool": tool, "matches": {"path": r"/(^|\/)\.\.(\/|$)/"}, "action": "reject"})
-        rules.append({"tool": tool, "matches": {"path": paths}, "action": "allow"})
-    return {"amp.permissions": [*rules, {"tool": "*", "action": "reject"}]}
 
 
 # Reasoning efforts a reviewer spec may end in, as `@effort`. codex, opencode and amp pass
@@ -261,11 +306,14 @@ class Reviewer:
                 remove(amp_dir)
             plugins = snap / AMP_PLUGINS
             plugins.mkdir(parents=True)
-            model = json.dumps(self.model)
             effort = f"\n\t\treasoningEffort: {json.dumps(self.effort)}," if self.effort else ""
-            plugin = AMP_PLUGIN.format(mode=AMP_MODE, model=model, effort=effort)
+            root = json.dumps(str(snap.absolute()))
+            values = {"MODE": AMP_MODE, "MODEL": json.dumps(self.model), "EFFORT": effort, "ROOT": root}
+            plugin = re.sub(r"__([A-Z]+)__", lambda match: values[match[1]], AMP_PLUGIN)
             write_generated(plugins / f"{AMP_MODE}.ts", plugin)
-            write_generated(snap / AMP_SETTINGS, json.dumps(amp_settings(snap), indent=2))
+            # Passed as `--settings-file`, so neither the user's settings nor a copy from
+            # the reviewed tree apply to the reviewer.
+            write_generated(snap / AMP_SETTINGS, "{}\n")
 
 
 def parse_reviewer(spec: str) -> Reviewer:
