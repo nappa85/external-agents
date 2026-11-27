@@ -72,7 +72,9 @@ and `.vibe/` for `vibe`. The diff still shows changes to those files.
 The reviewer process receives only an allowlisted environment: basic variables such as
 `PATH`, `HOME`, locale, proxy, and CA settings, plus the credential prefixes of its own
 provider: `ANTHROPIC_` for `claude`, `OPENAI_` for `codex`, `AMP_` for `amp`, `MISTRAL_` for
-`vibe`, and the model's provider for `opencode`. List any other variable a backend needs in
+`vibe`, and the model's provider for `opencode`. A sandboxed `amp` reviewer receives only
+`AMP_API_KEY` and `AMP_URL`: other `AMP_` variables, such as an Amp orb's identity, would be
+readable from its shell. List any other variable a backend needs in
 `EXTERNAL_AGENTS_ENV_PASSTHROUGH`.
 
 ## Amp without another CLI

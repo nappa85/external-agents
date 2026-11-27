@@ -27,8 +27,9 @@ permission prompts off.
   fresh HOME: `~/.local/share/opencode/auth.json`, `~/.claude/.credentials.json`,
   `~/.codex/auth.json`, `~/.local/share/amp/secrets.json`, or `~/.vibe/.env`. Provider
   credential variables of the backend's own provider only (`ANTHROPIC_*` for claude,
-  `OPENAI_*` for codex, `AMP_*` for amp, `MISTRAL_*` for vibe, the model's provider for
-  opencode; see `docs/cli.md`), `--env` values, which win over them, and the
+  `OPENAI_*` for codex, `MISTRAL_*` for vibe, the model's provider for opencode; see
+  [the CLI reference](https://github.com/nappa85/external-agents/blob/master/docs/cli.md)),
+  for amp only `AMP_API_KEY` and `AMP_URL`, `--env` values, which win over them, and the
   `EXTERNAL_AGENTS_ENV_PASSTHROUGH` names are passed too; every other variable is
   dropped. Because the login is read-only, a token refresh inside the sandbox is not
   saved: refresh your login on the host before a long run. The system keyring is out of

@@ -848,9 +848,9 @@ class ReviewerSelectionTests(Sandbox):
             f"cat {outside} 2>/dev/null || echo outside=hidden\n"
             "(echo planted > .amp/plugins/external-reviewer.ts) 2>/dev/null && echo plugin=writable || echo plugin=read-only\n"
             'echo "fn added() {}" > src/added.rs && echo write=ok\n'
-            'echo "github=${GITHUB_TOKEN:-unset} amp=${AMP_API_KEY:-unset}"',
+            'echo "github=${GITHUB_TOKEN:-unset} amp=${AMP_API_KEY:-unset} identity=${AMP_THREAD_IDENTITY_AUTH:-unset}"',
         )
-        env = {"AMP_API_KEY": "amp", "GITHUB_TOKEN": "gh"}
+        env = {"AMP_API_KEY": "amp", "GITHUB_TOKEN": "gh", "AMP_THREAD_IDENTITY_AUTH": "identity"}
 
         unconfined = self.review("--reviewer", "amp:p/model", env=env)
         unconfined_output = self.output.read_text()
@@ -864,7 +864,13 @@ class ReviewerSelectionTests(Sandbox):
         lines = self.output.read_text().splitlines()
         self.assertEqual(
             lines[:5],
-            ["reviewer: amp:p/model", "outside=hidden", "plugin=read-only", "write=ok", "github=unset amp=amp"],
+            [
+                "reviewer: amp:p/model",
+                "outside=hidden",
+                "plugin=read-only",
+                "write=ok",
+                "github=unset amp=amp identity=unset",
+            ],
         )
         self.assertIn("+fn added() {}", self.output.with_suffix(".patch").read_text())
         self.assertEqual(outside.read_text(), "OUTSIDE\n")

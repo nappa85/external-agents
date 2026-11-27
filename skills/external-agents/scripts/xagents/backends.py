@@ -88,6 +88,11 @@ CODER_CREDENTIALS: dict[str, tuple[str, ...]] = {
     "vibe": (".vibe/.env",),
 }
 
+# Variables an agent of these backends receives in the sandbox, instead of its whole credential
+# prefix: there it has a shell. An Amp orb signs its own `amp` in with other `AMP_` variables,
+# and one of them mints identity tokens that other services trust, such as a cloud role.
+SANDBOX_CREDENTIAL_NAMES: dict[str, frozenset[str]] = {"amp": frozenset({"AMP_API_KEY", "AMP_URL"})}
+
 # Inside the sandbox the agent may run commands: the sandbox, not the agent's own
 # permission system, is the boundary. Reads outside the working directory are denied, not
 # asked: nobody answers a question in `opencode run`, so an "ask" ends the run.

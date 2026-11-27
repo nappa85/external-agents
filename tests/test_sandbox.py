@@ -475,6 +475,43 @@ class Refusals(unittest.TestCase):
         pairs = {seen_argv[i + 1]: seen_argv[i + 2] for i, token in enumerate(seen_argv) if token == "--setenv"}
         self.assertEqual(pairs.get("OPENAI_BASE_URL"), "https://cli.example")
 
+    def test_an_amp_agent_receives_its_key_but_not_the_amp_host_identity(self) -> None:
+        # An Amp orb signs its own `amp` in with identity variables, and one of them mints
+        # tokens that other services trust. The agent has a shell, so it must not see them.
+        seen_argv: list[str] = []
+
+        class Stop(Exception):
+            pass
+
+        real_popen = subprocess.Popen
+
+        def popen(argv: list[str], **kwargs: object) -> object:
+            if "bwrap" not in argv:
+                return real_popen(argv, **kwargs)
+            seen_argv.extend(argv)
+            raise Stop
+
+        host = {
+            "AMP_API_KEY": "key", "AMP_URL": "https://amp.example", "AMP_THREAD_IDENTITY_AUTH": "identity",
+            "AMP_WORKLOAD_IDENTITY_REQUEST_TOKEN": "token", "AMP_EXECUTOR": "orb", "SANDBOX_EXTRA": "extra",
+            "EXTERNAL_AGENTS_ENV_PASSTHROUGH": "SANDBOX_EXTRA",
+        }  # fmt: skip
+        with tempfile.TemporaryDirectory() as tmp:
+            tree = worktree(Path(tmp))
+            args = self.namespace(tree, Path(tmp, "state"), agent="amp", no_seccomp=True)
+            with (
+                mock.patch.dict(os.environ, host),
+                mock.patch.object(sandbox.shutil, "which", return_value="/usr/bin/true"),
+                mock.patch.object(sandbox.subprocess, "Popen", popen),
+                self.assertRaises(Stop),
+            ):
+                sandbox.code(args, ["true"])
+        pairs = {seen_argv[i + 1]: seen_argv[i + 2] for i, token in enumerate(seen_argv) if token == "--setenv"}
+        self.assertEqual(
+            {name: value for name, value in pairs.items() if name.startswith("AMP_") or name == "SANDBOX_EXTRA"},
+            {"AMP_API_KEY": "key", "AMP_URL": "https://amp.example", "SANDBOX_EXTRA": "extra"},
+        )
+
     def test_empty_hosts_replaces_default_egress_and_strips_spaces(self) -> None:
         seen_hosts: list[list[str]] = []
 
