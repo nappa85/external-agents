@@ -117,7 +117,7 @@ Every run records its progress in `review-status.json` (`<name>.status.json` nex
 `--output`) and holds a lock on its first slot's log while it runs; a second run into the
 same outputs is refused. `--output` refuses names that `--output-dir` writes
 (`review-<n>`, `review-status`, `review-run`) and names ending in `.status.json`, `.log` or
-`.patch`, so two runs never share files.
+`.patch`, or stems ending in `.run` or `.status`, so two runs never share files.
 
 Exit: 0 every required slot produced a review; 3 a required slot had none (its file
 says why); 2 usage error, or another run writes to the same outputs.

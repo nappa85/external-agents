@@ -826,8 +826,9 @@ def output_paths(args: argparse.Namespace, count: int) -> list[Path]:
             raise UsageError(f"--output {args.output}: the wrapper writes files with that ending; pick another name")
         if count != 1:
             raise UsageError(f"the panel has {count} slots; pass --output-dir instead of --output")
-        # Case-insensitive file systems, such as macOS's, treat Review-1.md as review-1.md.
-        if re.fullmatch(r"review-(\d+|status|run)", args.output.stem, re.IGNORECASE):
+        # Case-insensitive file systems, such as macOS's, treat Review-1.md as review-1.md;
+        # `x.run.md` would use `x.run.log`, the run log of `--output x.md`.
+        if re.fullmatch(r"review-(\d+|status|run)|.*\.(run|status)", args.output.stem, re.IGNORECASE):
             raise UsageError(
                 f"--output {args.output}: names like review-1.md are --output-dir's files; pick another name"
             )

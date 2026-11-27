@@ -1252,6 +1252,23 @@ class ReviewStatusTests(Sandbox):
         self.assertEqual(result.returncode, 4, result.stdout + result.stderr)
         self.assertIn("review ended without finishing", result.stdout)
 
+    def test_a_stale_status_under_a_later_runs_lock_still_honours_the_timeout(self) -> None:
+        # A killed run's status, with a real run ID, stays while a later run holds the
+        # outputs and has not replaced it yet: review-status waits for the later run.
+        self.out.mkdir()
+        slot = {"slot": 1, "chain": ["amp:p/fast"], "state": "running", "log": "review-1.log"}
+        status = {"state": "running", "run": "b" * 32, "slots": [slot]}
+        (self.out / "review-status.json").write_text(json.dumps(status))
+        with review.status.hold(self.out / "review-1.log"):
+            result = subprocess.run(
+                [sys.executable, str(SCRIPT), "review-status", "--output-dir", str(self.out), "--wait",
+                 "--timeout", "0.5"],
+                capture_output=True, text=True, timeout=10,
+            )  # fmt: skip
+
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("review starting", result.stdout)
+
     def test_a_running_run_holds_a_lock_of_its_own_until_its_last_status(self) -> None:
         self.assertEqual(self.start("amp:p/slow").returncode, 0)
         run = json.loads((self.out / "review-status.json").read_text())["run"]
@@ -1262,6 +1279,11 @@ class ReviewStatusTests(Sandbox):
         done = self.status("--wait", "--timeout", "30", "--run", run)
 
         self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        # The run removes its lock just after its last status.
+        for _ in range(100):
+            if not own.exists():
+                break
+            time.sleep(0.1)
         self.assertFalse(own.exists())
 
     def test_the_printed_command_works_from_another_directory(self) -> None:
@@ -1278,6 +1300,7 @@ class ReviewStatusTests(Sandbox):
         )
 
         self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        self.assertIn(f"to {self.repo / 'reviews' / 'review-1.md'}", done.stdout)
 
     @unittest.skipIf(os.geteuid() == 0, "root traverses any directory")
     def test_an_untraversable_output_directory_counts_as_no_run(self) -> None:
@@ -1307,7 +1330,15 @@ class ReviewStatusTests(Sandbox):
         self.assertEqual(sorted(p.name for p in self.out.iterdir()), ["review-run.log"])
 
     def test_an_output_named_like_an_output_dir_file_is_refused(self) -> None:
-        for name in ("review-1.md", "review-status.md", "review-run.md", "summary.status.json", "Review-2.md"):
+        for name in (
+            "review-1.md",
+            "review-status.md",
+            "review-run.md",
+            "summary.status.json",
+            "Review-2.md",
+            "notes.run.md",
+            "review.LOG",
+        ):
             with self.subTest(name=name):
                 self.output = self.root / name
 

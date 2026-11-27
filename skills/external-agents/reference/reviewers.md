@@ -209,7 +209,7 @@ replaced this one, `review-status` exits 4 instead of reporting the later run.
 The run holds a lock on its first slot's log while it runs, which refuses a second run
 into the same outputs (exit 2), and a lock of its own, which tells a running run from a
 killed one. `--output` refuses names that `--output-dir` uses, such as `review-1.md`, and
-names ending in `.status.json`, `.log` or `.patch`, so two runs never share files.
+names ending in `.status.json`, `.log` or `.patch`, or stems ending in `.run` or `.status`, so two runs never share files.
 
 A reviewer may add or change files in its snapshot. The wrapper returns them as
 `review-<n>.patch`, which applies to the reviewed checkout with `git apply`; it leaves

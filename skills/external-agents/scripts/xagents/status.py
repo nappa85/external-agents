@@ -253,15 +253,16 @@ def review_status(args: argparse.Namespace) -> int:
         # meanwhile, such as the run finishing or a later run taking its place.
         if read(path) != status:
             continue
-        if not running:
+        if not running and args.run is None:
             # Without --run, a run that took the outputs' lock after the probe, before it
-            # wrote a status, is the outputs' run; with --run, the run read above has ended.
-            if args.run is None:
-                again = _probe(lock)
-                if again is None:
-                    return EXIT_NO_RUN
-                if again:
-                    continue
+            # replaced the status, is the outputs' run, still starting; with --run, the run
+            # read above has ended.
+            again = _probe(lock)
+            if again is None:
+                return EXIT_NO_RUN
+            if again:
+                status, running = None, True
+        if not running:
             if status is None:
                 print(f"no review run found: {path} {_missing(path)}", file=sys.stderr)
             else:
@@ -315,11 +316,12 @@ def background(script: Path, argv: list[str], output: Path | None, output_dir: P
         ended = child.poll() is not None
         status = read(path)
         if ended and child.returncode in RAN and (status is None or status.get("run") != run):
-            # It ran its slots, but a later run already replaced its status, reviews and
-            # run log, so `review-status` would report that run instead.
+            # It ran its slots, but its status is gone, replaced or removed, so
+            # `review-status` would report a later run, or none, instead.
             print(
-                f"review ran in the background and already ended with exit {child.returncode}; a later run into "
-                "the same outputs replaced its status, reviews and log, so do not run review-status for it"
+                f"review ran in the background and already ended with exit {child.returncode}; its status is gone "
+                f"and a later run into the same outputs may have replaced its reviews and {log}, so do not run "
+                "review-status for it"
             )
             return 0
         if status is not None and status.get("run") == run:
@@ -334,9 +336,12 @@ def background(script: Path, argv: list[str], output: Path | None, output_dir: P
             print(f"wait for it with: {shlex.join(command)}")
             return 0
         if ended:
-            # It ended without recording a run, such as on a usage error.
-            with contextlib.suppress(OSError):
+            # It ended without recording a run, such as on a usage error. Once it holds the
+            # outputs, its output is in the log it moved into place.
+            try:
                 sys.stderr.write(private.read_text())
+            except OSError:
+                print(f"review ended with exit {child.returncode} before recording its run; see {log}", file=sys.stderr)
             private.unlink(missing_ok=True)
             return child.returncode
         time.sleep(0.1)
