@@ -112,8 +112,9 @@ X=skills/external-agents/scripts/external_agents.py
 python3 -I $X review --prompt-file prompt.md --output-dir reviews/ --base main
 
 # The same in the background, then wait for it: one line per slot, the run's exit code
+# (run the exact `review-status` command it prints; its --run names this run)
 python3 -I $X review --background --prompt-file prompt.md --output-dir reviews/ --base main
-python3 -I $X review-status --wait --output-dir reviews/
+python3 -I $X review-status --wait --output-dir reviews/ --run <id>
 
 # Run a coding agent on a fresh worktree
 git worktree add -b feature ../wt/feature main

@@ -115,7 +115,9 @@ applies with `git apply`.
 
 Every run records its progress in `review-status.json` (`<name>.status.json` next to
 `--output`) and holds a lock on its first slot's log while it runs; a second run into the
-same outputs is refused.
+same outputs is refused. `--output` refuses names that `--output-dir` writes
+(`review-<n>`, `review-status`, `review-run`) and names ending in `.status.json`, `.log` or
+`.patch`, or stems ending in `.run` or `.status`, so two runs never share files.
 
 Exit: 0 every required slot produced a review; 3 a required slot had none (its file
 says why); 2 usage error, or another run writes to the same outputs.
@@ -129,10 +131,12 @@ missing (each reviewer's failure), or running (its chain and log).
 | ------------------ | -------------------------------------------------------- |
 | `--output-dir DIR` | the run's `--output-dir` (or `--output FILE`)            |
 | `--wait`           | block until the run ends                                 |
+| `--run ID`         | the ID `--background` printed; another run exits 4       |
 | `--timeout S`      | with `--wait`, stop waiting after S seconds              |
 
-Exit: the run's exit code once it finished; 1 while it runs; 4 no run, or it ended
-without finishing (killed or crashed).
+`--background` prints the exact command to run, with `--run`. Exit: the run's exit code
+once it finished; 1 while it runs; 4 no run, it ended without finishing (killed or
+crashed), or with `--run` a later run into the same outputs replaced it.
 
 ## `code`
 

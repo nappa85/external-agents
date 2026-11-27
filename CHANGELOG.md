@@ -6,12 +6,70 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.8] - 2026-11-27
+
+### Added
+
+- `review --background` and `review-status`. Nothing told a coordinator that ran a review in
+  the background when it ended. `--background` starts the run detached and returns once it
+  is under way; every run records each slot's outcome in `review-status.json` as the slot
+  ends; `review-status --wait` blocks until the run ends, prints each slot's reviewer or
+  why it has none, and exits with the run's exit code, or 4 when the run was killed.
+  A second run into the same outputs is refused.
+
+### Fixed
+
+- A leftover `XAGENTS_DETACHED_REVIEW` in a shell made `review --background` run in the
+  foreground. The detached run now gets its ID as a hidden argument instead, and
+  `--background` says when a run already ended before it saw its status. A run that
+  ran its slots counts as started even when a second run replaced its status first, and
+  `review-status` names a status file it cannot read instead of saying it does not exist.
+- `review-status` could report a later run into the same outputs as the run a coordinator
+  started. `--background` now prints the exact, shell-quoted command to wait with, including
+  `--run <id>`; with `--run`, any status but that run's, or none, exits 4. `review-status`
+  re-reads a status that changed while it probed the run's lock, so a run that finished or
+  started meanwhile is not reported as killed. An output directory it cannot traverse exits 4
+  instead of crashing with exit 1, and `--background` turns it into a usage error. A launch
+  that loses a race writes to a log of its own instead of truncating the winner's.
+  `--output` refuses names that `--output-dir` uses, such as `review-1.md`, and names ending
+  in `.status.json`. Each run also holds a lock of its own, so a killed run is reported as
+  ended even while a later run holds the outputs; the detached run publishes its log
+  itself, under the outputs' lock; and the printed command uses absolute paths, so it works
+  from any directory. A stale status under a later run's lock no longer makes `review-status`
+  spin past `--timeout`, `--output` refuses stems ending in `.run` or `.status`, and
+  `--background` points at the run log when the run failed after taking the outputs.
+- `review --background` could take an earlier run's status for the new run's when the
+  system reused the earlier run's pid, and report the old outcome. It now gives the run an
+  ID and accepts only a status that carries it. A status file with malformed slot fields
+  makes `review-status` exit 4 instead of crashing with exit 1, which means running.
+- `review --background` returned the run's own exit code, such as 3, as a failure to
+  start when the run ended before its first check. A run that recorded its status now
+  counts as started, and its outcome comes from `review-status`.
+
+## [0.1.7] - 2026-11-27
+
 ### Security
 
 - An `amp` agent in the bubblewrap sandbox, a coding agent or a sandboxed reviewer, received
   every `AMP_` variable, including an Amp orb's identity variables, one of which mints
   tokens that other services trust. Its shell could read them. In the sandbox it now
   receives only `AMP_API_KEY` and `AMP_URL`, plus the `EXTERNAL_AGENTS_ENV_PASSTHROUGH` names.
+
+## [0.1.6] - 2026-11-27
+
+### Added
+
+- `EXTERNAL_AGENTS_REVIEW_SANDBOX=1` runs reviewers in the bubblewrap sandbox that `code`
+  uses, with a shell, so they can search and run the tests; `codex` is confined there too.
+  Without a working bwrap they keep file tools only.
+- The handoff diff shows whole changed functions, so reviewers open fewer files.
+- `amp` reviewers can search: the generated mode adds `search_files` (a regular expression
+  over file contents) and `find_files` (a glob over paths), confined to the snapshot like
+  its file tools. Amp has no search tool of its own, so reviewers read whole files to find
+  a definition.
+
+### Security
+
 - The `amp` reviewer's confinement no longer relies on `amp.permissions` rules, which Amp
   removes on 2026-12-04. The generated plugin's `tool.call` hook allows only its file tools,
   on absolute paths whose real location, links resolved, is inside the snapshot. It also
@@ -41,14 +99,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- `review --background` could take an earlier run's status for the new run's when the
-  system reused the earlier run's pid, and report the old outcome. It now gives the run an
-  ID and accepts only a status that carries it. A status file with malformed slot fields
-  makes `review-status` exit 4 instead of crashing with exit 1, which means running.
-- `review --background` returned the run's own exit code, such as 3, as a failure to
-  start when the run ended before its first check. A run that recorded its status now
-  counts as started, and its outcome comes from `review-status`. A malformed status file
-  makes `review-status` exit 4 instead of crashing with exit 1, which means running.
 - A reviewer thinking for longer than `--idle-timeout` was killed as stalled. The timeout
   grows with `@effort`, a retry allows twice the silence, and a silent `amp` run is checked
   on the server: a turn still in flight earns more time, and one that finished is taken as
@@ -78,22 +128,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   opening a file into that number at the same moment. bwrap now reads the filter from the
   descriptor it was opened on (`--seccomp N`).
 
+## [0.1.5] - 2026-11-26
+
 ### Added
 
-- `review --background` and `review-status`. Nothing told a coordinator that ran a review in
-  the background when it ended. `--background` starts the run detached and returns once it
-  is under way; every run records each slot's outcome in `review-status.json` as the slot
-  ends; `review-status --wait` blocks until the run ends, prints each slot's reviewer or
-  why it has none, and exits with the run's exit code, or 4 when the run was killed.
-  A second run into the same outputs is refused.
-- `EXTERNAL_AGENTS_REVIEW_SANDBOX=1` runs reviewers in the bubblewrap sandbox that `code`
-  uses, with a shell, so they can search and run the tests; `codex` is confined there too.
-  Without a working bwrap they keep file tools only.
-- The handoff diff shows whole changed functions, so reviewers open fewer files.
-- `amp` reviewers can search: the generated mode adds `search_files` (a regular expression
-  over file contents) and `find_files` (a glob over paths), confined to the snapshot like
-  its file tools. Amp has no search tool of its own, so reviewers read whole files to find
-  a definition.
 - `EXTERNAL_AGENTS_AMP_NO_CREDITS=1` runs an `amp` reviewer only when a provider
   connection linked to the Amp account, such as a ChatGPT subscription, serves its model.
   `amp config model-providers check-access` decides before each `amp` reviewer runs; a
@@ -188,7 +226,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   CLIs are installed when missing.
 - MIT license.
 
-[Unreleased]: https://github.com/nappa85/external-agents/compare/v0.1.4...HEAD
+[Unreleased]: https://github.com/nappa85/external-agents/compare/v0.1.8...HEAD
+[0.1.8]: https://github.com/nappa85/external-agents/compare/v0.1.7...v0.1.8
+[0.1.7]: https://github.com/nappa85/external-agents/compare/v0.1.6...v0.1.7
+[0.1.6]: https://github.com/nappa85/external-agents/compare/v0.1.5...v0.1.6
+[0.1.5]: https://github.com/nappa85/external-agents/compare/v0.1.4...v0.1.5
 [0.1.4]: https://github.com/nappa85/external-agents/compare/v0.1.3...v0.1.4
 [0.1.3]: https://github.com/nappa85/external-agents/compare/v0.1.2...v0.1.3
 [0.1.2]: https://github.com/nappa85/external-agents/compare/v0.1.1...v0.1.2

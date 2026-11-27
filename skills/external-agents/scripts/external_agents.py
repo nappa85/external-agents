@@ -11,7 +11,7 @@ reviewers or as sandboxed coding agents.
 
 Exit codes: 0 success; 2 usage or setup error; 3 (review) a required reviewer slot had no
 available reviewer; for `review-status`, the run's exit code once it finished, 1 while it
-runs, 4 when there is no run or it ended without finishing; the coding agent's own exit code, or 124 on timeout, for `code`;
+runs, 4 when there is no run, it ended without finishing, or a later run replaced it; the coding agent's own exit code, or 124 on timeout, for `code`;
 1 (question) none waiting; 4 (question, answer) no active run.
 """
 
@@ -125,7 +125,7 @@ def main(argv: list[str]) -> int:
         if args.command == "install":
             return install(args)
         # The detached run gets the same arguments, so it must not detach again.
-        if args.command == "review" and args.background and not os.environ.get(status.ENV_DETACHED):
+        if args.command == "review" and args.background and args.detached_run is None:
             return status.background(Path(__file__).resolve(), argv, args.output, args.output_dir)
         if args.command == "review":
             return review.review(args)

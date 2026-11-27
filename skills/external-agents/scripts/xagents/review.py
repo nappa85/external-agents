@@ -22,6 +22,7 @@ import sys
 import tempfile
 import time
 import traceback
+import uuid
 from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
@@ -821,10 +822,22 @@ def review_slot(
 
 def output_paths(args: argparse.Namespace, count: int) -> list[Path]:
     if args.output is not None:
-        if args.output.suffix in (".patch", ".log"):
-            raise UsageError(f"--output must not end in {args.output.suffix}; the wrapper writes that file")
+        if args.output.suffix.lower() in (".patch", ".log") or args.output.name.lower().endswith(".status.json"):
+            raise UsageError(f"--output {args.output}: the wrapper writes files with that ending; pick another name")
         if count != 1:
             raise UsageError(f"the panel has {count} slots; pass --output-dir instead of --output")
+        # Case-insensitive file systems, such as macOS's, treat Review-1.md as review-1.md;
+        # `x.run.md` would use `x.run.log`, the run log of `--output x.md`.
+        stem = args.output.stem.lower()
+        if re.fullmatch(r"review-(\d+|status|run)", stem):
+            raise UsageError(
+                f"--output {args.output}: names like review-1.md are --output-dir's files; pick another name"
+            )
+        if stem.endswith((".run", ".status")):
+            raise UsageError(
+                f"--output {args.output}: stems ending in .run or .status are reserved, since <stem>.run.log is "
+                "the run log of another output; pick a stem that does not end in .run or .status"
+            )
         if not args.output.parent.is_dir():
             raise UsageError(f"cannot use --output {args.output}: {args.output.parent} is not a directory")
         return [args.output]
@@ -897,21 +910,34 @@ def review(args: argparse.Namespace) -> int:
     if patch is not None:
         files[DIFF_FILE], files[FILES_FILE] = filter_patch(patch)
     status_file = status.status_path(args.output, args.output_dir)
+    run = args.detached_run or uuid.uuid4().hex
     with status.hold(status.lock_path(args.output, args.output_dir)):
         status_file.unlink(missing_ok=True)
-        slots = [
-            {"optional": slot.optional, "chain": [r.label for r in slot.reviewers], "review": str(path),
-             "log": str(path.with_suffix(".log"))}
-            for slot, path in zip(panel, paths, strict=True)
-        ]  # fmt: skip
-        tracker = status.Tracker(status_file, slots)
-        try:
-            code = run_panel(args, source, panel, paths, files, exclude, tracker)
-        except BaseException:
-            tracker.finish(2)
-            raise
-        tracker.finish(code)
-        return code
+        if args.detached_run is not None:
+            # Published under the outputs' lock, so it never replaces another run's log.
+            log = status.run_log_path(args.output, args.output_dir)
+            with contextlib.suppress(FileNotFoundError):
+                os.replace(status.private_log_path(log, run), log)
+        run_lock = status.run_lock_path(status_file, run)
+        assert run_lock is not None
+        with status.hold(run_lock):
+            try:
+                slots = [
+                    {"optional": slot.optional, "chain": [r.label for r in slot.reviewers], "review": str(path.absolute()),
+                     "log": str(path.with_suffix(".log").absolute())}
+                    for slot, path in zip(panel, paths, strict=True)
+                ]  # fmt: skip
+                tracker = status.Tracker(status_file, slots, run)
+                try:
+                    code = run_panel(args, source, panel, paths, files, exclude, tracker)
+                except BaseException:
+                    tracker.finish(2)
+                    raise
+                tracker.finish(code)
+                return code
+            finally:
+                # After the last status, so a probe that finds no lock reads a finished run.
+                run_lock.unlink(missing_ok=True)
 
 
 def finish_slot(
@@ -937,7 +963,9 @@ def finish_slot(
         print(f"{kind} {number}: {reviewer.label} proposed changes in {patch_path}", file=sys.stderr)
     path.write_text(text)
     print(f"{kind} {number}: review by {reviewer.label} written to {path}", file=sys.stderr)
-    tracker.slot(number, state="written", reviewer=reviewer.label, patch=str(patch_path) if patch_path else None)
+    tracker.slot(
+        number, state="written", reviewer=reviewer.label, patch=str(patch_path.absolute()) if patch_path else None
+    )
 
 
 def run_panel(
@@ -1011,3 +1039,4 @@ def add_parser(commands: argparse._SubParsersAction) -> None:
         action="store_true",
         help="Start the run detached and return once it is under way; follow it with review-status",
     )
+    run.add_argument(status.DETACHED_RUN, dest="detached_run", type=status.detached_run_id, help=argparse.SUPPRESS)

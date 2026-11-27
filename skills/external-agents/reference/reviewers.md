@@ -163,8 +163,8 @@ python3 -I <skill-dir>/scripts/external_agents.py review \
 
 Slots run in parallel, so a panel takes about as long as its slowest slot; a review can
 take several minutes. Start it with `--background` next to your own subagent, not with a
-shell's `&`: `--background` returns only once the run has replaced any earlier run's
-status, so `review-status` never reports the previous run.
+shell's `&`: `--background` returns only once the run has recorded its status, and prints a
+`review-status` command whose `--run` names the run, so it never reports another run.
 
 `review` exits:
 
@@ -177,29 +177,40 @@ status, so `review-status` never reports the previous run.
 ### Follow a run
 
 `--background` starts the run detached, writes its own output to `review-run.log` in the
-output directory (`<name>.run.log` next to `--output`), and returns as soon as the run is
-under way, or with the run's exit code when it fails to start, such as on a usage error.
+output directory (`<name>.run.log` next to `--output`), and returns 0 as soon as the run has
+recorded its status. When the run fails to start, such as on a usage error, it returns the
+run's exit code instead. When the run already ended and its status is gone, replaced or
+removed, it says so with the run's exit code and returns 0: the printed exit code is the
+outcome, a later run may have replaced the reviews, and `review-status` would describe that
+later run, so start the review again. A fresh `--output-dir` per review avoids this.
 Any run, in the background or not, records its progress in `review-status.json`
 (`<name>.status.json`): each slot's reviewer chain, and its outcome as soon as the slot
 ends.
 
 ```bash
-python3 -I <skill-dir>/scripts/external_agents.py review-status --wait --output-dir "$OUT_DIR"
+python3 -I <skill-dir>/scripts/external_agents.py review-status --wait --output-dir "$OUT_DIR" --run "$RUN_ID"
 ```
+
+`$RUN_ID` is the ID in the `wait for it with:` command that `--background` printed; running
+that command as printed is simplest.
 
 `review-status` reads that file and prints the run, then one line per slot: `written by
 <reviewer> to <file>`, with the patch when there is one, `missing, no reviewer available
 (<why>)`, or `running (<chain>)` with its log. `--wait` blocks until the run ends;
-`--timeout <s>` bounds the wait. Pass the same `--output-dir` or `--output` as the run.
+`--timeout <s>` bounds the wait. Pass the same `--output-dir` or `--output` as the run, and
+the `--run` ID that `--background` printed: when a later run into the same outputs has
+replaced this one, `review-status` exits 4 instead of reporting the later run.
 
 | Exit   | Meaning                                                                     |
 | ------ | --------------------------------------------------------------------------- |
 | 0, 3   | the run finished; the run's own exit code (2 if the wrapper itself failed) |
 | 1      | still running (without `--wait`, or when `--timeout` expired)               |
-| 4      | no run in this output directory, or it was killed before it finished        |
+| 4      | no run, it was killed before it finished, or (`--run`) a later run replaced it |
 
-The run holds a lock on its first slot's log while it runs, which tells a running run
-from a killed one, and refuses a second run into the same outputs (exit 2).
+The run holds a lock on its first slot's log while it runs, which refuses a second run
+into the same outputs (exit 2), and a lock of its own, which tells a running run from a
+killed one. `--output` refuses names that `--output-dir` uses, such as `review-1.md`, and
+names ending in `.status.json`, `.log` or `.patch`, or stems ending in `.run` or `.status`, so two runs never share files.
 
 A reviewer may add or change files in its snapshot. The wrapper returns them as
 `review-<n>.patch`, which applies to the reviewed checkout with `git apply`; it leaves

@@ -63,9 +63,13 @@ skills/external-agents/scripts/
    git command, and attributes that would convert content are unset). The diff, minus handoff files, generated configuration,
    and secret-like files, becomes `review-<n>.patch`.
 8. **Status.** The run writes `review-status.json` atomically when it starts, when each
-   slot ends, and when it ends, and holds an `flock` on its first slot's log meanwhile.
-   `review-status` reads the file; a file that is not finished while nobody holds the lock
-   is a run that was killed. Status files and run logs stay out of the snapshot.
+   slot ends, and when it ends. It holds an `flock` on its first slot's log, which refuses a
+   second run into the same outputs, and one on `.review-status.json.<run>.lock`, a file of
+   its own, until after its last status. `review-status` reads the file and probes that
+   run's own lock: a status that is not finished while nobody holds it is a run that was
+   killed, even when a later run already holds the outputs. A detached run moves its
+   private log to `review-run.log` itself, under the outputs' lock. Status files, run logs,
+   locks and their temporary copies stay out of the snapshot.
 
 ## Coding sandbox
 

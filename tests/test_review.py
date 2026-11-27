@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import argparse
+import io
 import json
 import os
+import shlex
 import shutil
 import stat
 import subprocess
@@ -688,7 +691,10 @@ class ReviewerSelectionTests(Sandbox):
             "! grep -qF reviews/review-1. REVIEW_DIFF.patch REVIEW_FILES.txt && echo independent review",
         )
 
-        result = self.review("--base", "HEAD")
+        result = self.run_script(
+            "review", "--prompt-file", str(self.prompt), "--no-preflight", "--reviewer", "claude",
+            "--output-dir", str(self.output.parent), "--base", "HEAD",
+        )  # fmt: skip
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("independent review", self.output.read_text())
@@ -963,7 +969,8 @@ class ReviewStatusTests(Sandbox):
         super().setUp()
         self.out = self.root / "out"
         self.release = self.root / "release"
-        self.addCleanup(self.release.touch)
+        # Runs before the temporary directory is removed: cleanups run last first.
+        self.addCleanup(self.finish_background_runs)
         self.fake(
             "amp",
             "if grep -q 'model: \"p/slow\"' .amp/plugins/external-reviewer.ts; then\n"
@@ -972,6 +979,15 @@ class ReviewStatusTests(Sandbox):
         )
         self.fake("opencode", 'echo "Error: model not found"; exit 1')
         self.env = {"RELEASE": str(self.release), "EXTERNAL_AGENTS_ENV_PASSTHROUGH": "RELEASE"}
+
+    def finish_background_runs(self) -> None:
+        """Let a slow run end and wait for it, so it is not writing while its files go."""
+        self.release.touch()
+        for lock in [self.out / "review-1.log", *self.out.glob(".review-status.json.*.lock")]:
+            for _ in range(300):
+                if not review.status.alive(lock):
+                    break
+                time.sleep(0.1)
 
     def start(self, panel: str) -> subprocess.CompletedProcess[str]:
         return self.run_script(
@@ -1006,7 +1022,13 @@ class ReviewStatusTests(Sandbox):
         self.assertEqual(timed_out.returncode, 1, timed_out.stderr)
 
         self.release.touch()
-        done = self.status("--wait", "--timeout", "30")
+        # Exactly the command `--background` printed, which names this run.
+        printed = started.stdout.split("wait for it with: ", 1)[1].strip()
+        run = json.loads((self.out / "review-status.json").read_text())["run"]
+        self.assertIn(f"--run {run}", printed)
+        done = subprocess.run(
+            [*shlex.split(printed), "--timeout", "30"], cwd=self.repo, capture_output=True, text=True, env=self.env
+        )
 
         self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
         self.assertTrue(done.stdout.startswith("review finished at "), done.stdout)
@@ -1052,6 +1074,7 @@ class ReviewStatusTests(Sandbox):
 
         self.assertEqual(result.returncode, 4, result.stdout + result.stderr)
         self.assertIn("no review run found", result.stderr)
+        self.assertIn("does not exist", result.stderr)
 
     def test_a_background_run_that_fails_to_start_reports_its_error(self) -> None:
         result = self.run_script(
@@ -1122,16 +1145,265 @@ class ReviewStatusTests(Sandbox):
         script = self.root / "fast_run.py"
         script.write_text(
             "import json, os, sys\n"
-            "out = sys.argv[-1]\n"
-            "run = os.environ['XAGENTS_DETACHED_REVIEW']\n"
+            "out, run = sys.argv[1], sys.argv[-1]\n"
             "open(os.path.join(out, 'review-status.json'), 'w').write(json.dumps({'pid': os.getpid(), 'run': run}))\n"
             "sys.exit(3)\n"
         )
+        self.out.mkdir()
+        # A later run's log: only a run that holds the outputs publishes its log.
+        (self.out / "review-run.log").write_text("a later run's output\n")
         real_sleep = time.sleep
-        with mock.patch.object(review.status.time, "sleep", lambda _: real_sleep(1)), mock.patch("sys.stdout"):
+        out = io.StringIO()
+        with mock.patch.object(review.status.time, "sleep", lambda _: real_sleep(1)), mock.patch("sys.stdout", out):
             code = review.status.background(script, [str(self.out)], None, self.out)
 
         self.assertEqual(code, 0)
+        self.assertEqual((self.out / "review-run.log").read_text(), "a later run's output\n")
+        self.assertIn("review started in the background", out.getvalue())
+        run = json.loads((self.out / "review-status.json").read_text())["run"]
+        self.assertIn(f"review-status --wait --output-dir {self.out} --run {run}", out.getvalue())
+
+    def test_a_run_that_ran_but_whose_status_was_replaced_still_counts_as_started(self) -> None:
+        # As if a second run replaced the status before `--background` read it: the child
+        # ran its slots and exited 3, but no status carries its ID.
+        script = self.root / "replaced_run.py"
+        script.write_text(
+            "import json, os, sys\n"
+            "open(os.path.join(sys.argv[1], 'review-status.json'), 'w').write(json.dumps({'run': 'later'}))\n"
+            "sys.exit(3)\n"
+        )
+        out = io.StringIO()
+        with mock.patch("sys.stdout", out), mock.patch("sys.stderr"):
+            code = review.status.background(script, [str(self.out)], None, self.out)
+
+        self.assertEqual(code, 0)
+        self.assertIn("already ended with exit 3", out.getvalue())
+        self.assertNotIn("review-status --wait", out.getvalue())
+
+    def test_a_boolean_exit_is_not_taken_as_an_exit_code(self) -> None:
+        self.out.mkdir()
+        for value in (True, False):
+            with self.subTest(exit=value):
+                status = {"state": "finished", "finished": "now", "exit": value, "slots": []}
+                (self.out / "review-status.json").write_text(json.dumps(status))
+
+                self.assertEqual(self.status().returncode, 4)
+
+    def test_status_with_a_run_id_does_not_report_a_later_run(self) -> None:
+        self.out.mkdir()
+        for state in ("finished", "running", None):
+            with self.subTest(later=state):
+                path = self.out / "review-status.json"
+                path.unlink(missing_ok=True)
+                if state is not None:
+                    later = {"state": state, "finished": "now", "exit": 0, "run": "later", "slots": []}
+                    path.write_text(json.dumps(later))
+
+                result = self.status("--wait", "--run", "mine")
+
+                self.assertEqual(result.returncode, 4, result.stdout + result.stderr)
+                self.assertIn("a later run" if state is None else "was replaced by a later run", result.stderr)
+        self.assertEqual(self.status("--run", "").returncode, 2)
+
+    def test_a_status_that_changes_during_the_lock_probe_is_read_again(self) -> None:
+        self.out.mkdir()
+        path = self.out / "review-status.json"
+        slot = {"slot": 1, "chain": ["amp:p/fast"], "state": "running", "log": "review-1.log"}
+        finished = {"state": "finished", "finished": "now", "exit": 3, "run": "mine", "slots": []}
+        later = {"state": "running", "run": "later", "slots": []}
+        # (what the status becomes during the probe, what the probe answers, --run, exit)
+        cases = [
+            (finished, False, "mine", 3),  # the run finished and released its lock
+            (finished, True, "mine", 3),  # ... and a later run already holds the lock
+            (later, True, "mine", 4),  # a later run replaced it
+            (later, True, None, 1),  # ... which is the outputs' run without --run
+        ]
+        for during, held, run, expected in cases:
+            with self.subTest(during=during["run"], held=held, run=run):
+                path.write_text(json.dumps({"state": "running", "run": "mine", "slots": [slot]}))
+
+                def probe(_: Path, during: dict = during, held: bool = held) -> bool:
+                    path.write_text(json.dumps(during))
+                    return held
+
+                args = argparse.Namespace(output=None, output_dir=self.out, wait=False, timeout=None, run=run)
+                with (
+                    mock.patch.object(review.status, "alive", probe),
+                    mock.patch("sys.stdout"),
+                    mock.patch("sys.stderr"),
+                ):
+                    code = review.status.review_status(args)
+
+                self.assertEqual(code, expected)
+
+    def test_a_run_that_takes_the_lock_after_the_probe_is_not_reported_killed(self) -> None:
+        # The killed run's status is still there; a new run took the lock just after the
+        # probe and has not replaced the status yet.
+        self.out.mkdir()
+        slot = {"slot": 1, "chain": ["amp:p/fast"], "state": "running", "log": "review-1.log"}
+        (self.out / "review-status.json").write_text(json.dumps({"state": "running", "run": "old", "slots": [slot]}))
+        args = argparse.Namespace(output=None, output_dir=self.out, wait=False, timeout=None, run=None)
+
+        with mock.patch.object(review.status, "alive", side_effect=[False, True, True]), mock.patch("sys.stdout"):
+            code = review.status.review_status(args)
+
+        self.assertEqual(code, 1)
+
+    def test_a_killed_run_is_not_kept_alive_by_a_later_run_holding_the_outputs(self) -> None:
+        # Run A was killed, so its own lock is gone; run B already holds the outputs' lock
+        # but has not replaced A's status yet.
+        self.out.mkdir()
+        run = "a" * 32
+        slot = {"slot": 1, "chain": ["amp:p/fast"], "state": "running", "log": "review-1.log"}
+        (self.out / "review-status.json").write_text(json.dumps({"state": "running", "run": run, "slots": [slot]}))
+        with review.status.hold(self.out / "review-1.log"):
+            result = self.status("--run", run)
+
+        self.assertEqual(result.returncode, 4, result.stdout + result.stderr)
+        self.assertIn("review ended without finishing", result.stdout)
+
+    def test_a_stale_status_under_a_later_runs_lock_still_honours_the_timeout(self) -> None:
+        # A killed run's status, with a real run ID, stays while a later run holds the
+        # outputs and has not replaced it yet: review-status waits for the later run.
+        self.out.mkdir()
+        slot = {"slot": 1, "chain": ["amp:p/fast"], "state": "running", "log": "review-1.log"}
+        status = {"state": "running", "run": "b" * 32, "slots": [slot]}
+        (self.out / "review-status.json").write_text(json.dumps(status))
+        with review.status.hold(self.out / "review-1.log"):
+            began = time.monotonic()
+            result = subprocess.run(
+                [sys.executable, str(SCRIPT), "review-status", "--output-dir", str(self.out), "--wait",
+                 "--timeout", "0.5"],
+                capture_output=True, text=True, timeout=10,
+            )  # fmt: skip
+
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("review starting", result.stdout)
+        # It waited for the timeout instead of giving up at once.
+        self.assertGreaterEqual(time.monotonic() - began, 0.4)
+
+    def test_a_running_run_holds_a_lock_of_its_own_until_its_last_status(self) -> None:
+        self.assertEqual(self.start("amp:p/slow").returncode, 0)
+        run = json.loads((self.out / "review-status.json").read_text())["run"]
+        own = self.out / f".review-status.json.{run}.lock"
+        self.assertTrue(review.status.alive(own))
+
+        self.release.touch()
+        done = self.status("--wait", "--timeout", "30", "--run", run)
+
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        # The run removes its lock just after its last status.
+        for _ in range(100):
+            if not own.exists():
+                break
+            time.sleep(0.1)
+        self.assertFalse(own.exists())
+
+    def test_the_printed_command_works_from_another_directory(self) -> None:
+        self.release.touch()
+        started = self.run_script(
+            "review", "--prompt-file", str(self.prompt), "--output-dir", "reviews", "--no-preflight",
+            "--reviewers", "amp:p/fast", "--background", env=self.env,
+        )  # fmt: skip
+        self.assertEqual(started.returncode, 0, started.stdout + started.stderr)
+        printed = started.stdout.split("wait for it with: ", 1)[1].strip()
+
+        done = subprocess.run(
+            [*shlex.split(printed), "--timeout", "30"], cwd=self.root, capture_output=True, text=True, env=self.env
+        )
+
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        self.assertIn(f"to {self.repo / 'reviews' / 'review-1.md'}", done.stdout)
+
+    def test_the_printed_command_for_an_output_file_works_from_another_directory(self) -> None:
+        self.release.touch()
+        (self.repo / "reviews").mkdir()
+        started = self.run_script(
+            "review", "--prompt-file", str(self.prompt), "--output", "reviews/x.md", "--no-preflight",
+            "--reviewers", "amp:p/fast", "--background", env=self.env,
+        )  # fmt: skip
+        self.assertEqual(started.returncode, 0, started.stdout + started.stderr)
+        printed = started.stdout.split("wait for it with: ", 1)[1].strip()
+
+        done = subprocess.run(
+            [*shlex.split(printed), "--timeout", "30"], cwd=self.root, capture_output=True, text=True, env=self.env
+        )
+
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+
+    @unittest.skipIf(os.geteuid() == 0, "root traverses any directory")
+    def test_an_untraversable_output_directory_counts_as_no_run(self) -> None:
+        self.out.mkdir()
+        (self.out / "review-status.json").write_text("{}")
+        self.out.chmod(0)
+        self.addCleanup(self.out.chmod, 0o755)
+
+        result = self.status()
+        started = self.start("amp:p/fast")
+
+        self.assertEqual(result.returncode, 4, result.stdout + result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+        self.assertEqual(started.returncode, 2, started.stdout + started.stderr)
+        self.assertNotIn("Traceback", started.stderr)
+
+    def test_a_launch_that_loses_the_race_leaves_the_winners_run_log_alone(self) -> None:
+        self.out.mkdir()
+        (self.out / "review-run.log").write_text("the winner's output\n")
+        script = self.root / "loser.py"
+        script.write_text("import sys\nprint('error: a review is already running')\nsys.exit(2)\n")
+        with mock.patch("sys.stderr"):
+            code = review.status.background(script, [str(self.out)], None, self.out)
+
+        self.assertEqual(code, 2)
+        self.assertEqual((self.out / "review-run.log").read_text(), "the winner's output\n")
+        self.assertEqual(sorted(p.name for p in self.out.iterdir()), ["review-run.log"])
+
+    def test_an_output_named_like_an_output_dir_file_is_refused(self) -> None:
+        for name in (
+            "review-1.md",
+            "review-status.md",
+            "review-run.md",
+            "summary.status.json",
+            "Review-2.md",
+            "notes.run.md",
+            "notes.RUN.md",
+            "notes.status.md",
+            "x\n.run.md",
+            "review.LOG",
+        ):
+            with self.subTest(name=name):
+                self.output = self.root / name
+
+                result = self.review(env={"EXTERNAL_REVIEWERS": "amp:p/fast"})
+
+                self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                stem = name.rsplit(".", 1)[0].lower()
+                if name.lower().endswith((".log", ".patch", ".status.json")):
+                    self.assertIn("the wrapper writes files with that ending", result.stderr)
+                elif stem.endswith((".run", ".status")):
+                    self.assertIn("stems ending in .run or .status are reserved", result.stderr)
+                else:
+                    self.assertIn("--output-dir's files", result.stderr)
+
+    def test_the_hidden_run_option_leaves_short_prefixes_unambiguous(self) -> None:
+        self.release.touch()
+        diff = self.root / "change.patch"
+        diff.write_text("")
+
+        result = self.review("--d", str(diff), env={"EXTERNAL_REVIEWERS": "amp:p/fast"})
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_a_shell_variable_cannot_keep_background_in_the_foreground(self) -> None:
+        # The variable the detached run once recognised; leftover in a shell, it made
+        # `--background` block until the review ended.
+        self.env["XAGENTS_DETACHED_REVIEW"] = "leftover"
+
+        started = self.start("amp:p/slow")
+
+        self.assertEqual(started.returncode, 0, started.stdout + started.stderr)
+        self.assertIn("review started in the background", started.stdout)
+        self.assertEqual(self.status().returncode, 1)
 
     def test_a_status_with_this_runs_pid_but_not_its_id_is_not_taken_as_started(self) -> None:
         # As if the system reused an earlier run's pid: the old status names this child's
@@ -1139,7 +1411,7 @@ class ReviewStatusTests(Sandbox):
         script = self.root / "failed_start.py"
         script.write_text(
             "import json, os, sys, time\n"
-            "out = sys.argv[-1]\n"
+            "out = sys.argv[1]\n"
             "open(os.path.join(out, 'review-status.json'), 'w').write(json.dumps({'pid': os.getpid(), 'run': 'old'}))\n"
             "time.sleep(0.5)\n"
             "sys.exit(2)\n"
@@ -1151,13 +1423,23 @@ class ReviewStatusTests(Sandbox):
 
     def test_a_malformed_status_counts_as_no_run(self) -> None:
         self.out.mkdir()
-        for slots in (5, [5], [{"chain": 5}], [{"state": "missing", "reasons": [5]}]):
+        for slots in (
+            5,
+            [5],
+            [{"chain": 5}],
+            [{"chain": 0}],
+            [{"chain": {}}],
+            [{"reasons": 0}],
+            [{"reasons": ""}],
+            [{"state": "missing", "reasons": [5]}],
+        ):
             with self.subTest(slots=slots):
                 (self.out / "review-status.json").write_text(json.dumps({"state": "finished", "slots": slots}))
 
                 result = self.status()
 
                 self.assertEqual(result.returncode, 4, result.stdout + result.stderr)
+                self.assertIn("exists but could not be read as a status", result.stderr)
                 self.assertNotIn("Traceback", result.stderr)
 
     def test_a_foreground_run_with_output_records_its_status_next_to_it(self) -> None:
