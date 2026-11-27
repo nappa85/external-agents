@@ -53,15 +53,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   started meanwhile is not reported as killed. An output directory it cannot traverse exits 4
   instead of crashing with exit 1, and `--background` turns it into a usage error. A launch
   that loses a race writes to a log of its own instead of truncating the winner's.
-  `--output` refuses names that `--output-dir` uses, such as `review-1.md`.
+  `--output` refuses names that `--output-dir` uses, such as `review-1.md`, and names ending
+  in `.status.json`. Each run also holds a lock of its own, so a killed run is reported as
+  ended even while a later run holds the outputs; the detached run publishes its log
+  itself, under the outputs' lock; and the printed command uses absolute paths, so it works
+  from any directory.
 - `review --background` could take an earlier run's status for the new run's when the
   system reused the earlier run's pid, and report the old outcome. It now gives the run an
   ID and accepts only a status that carries it. A status file with malformed slot fields
   makes `review-status` exit 4 instead of crashing with exit 1, which means running.
 - `review --background` returned the run's own exit code, such as 3, as a failure to
   start when the run ended before its first check. A run that recorded its status now
-  counts as started, and its outcome comes from `review-status`. A malformed status file
-  makes `review-status` exit 4 instead of crashing with exit 1, which means running.
+  counts as started, and its outcome comes from `review-status`.
 - A reviewer thinking for longer than `--idle-timeout` was killed as stalled. The timeout
   grows with `@effort`, a retry allows twice the silence, and a silent `amp` run is checked
   on the server: a turn still in flight earns more time, and one that finished is taken as

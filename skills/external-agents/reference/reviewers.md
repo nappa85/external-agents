@@ -206,10 +206,10 @@ replaced this one, `review-status` exits 4 instead of reporting the later run.
 | 1      | still running (without `--wait`, or when `--timeout` expired)               |
 | 4      | no run, it was killed before it finished, or (`--run`) a later run replaced it |
 
-The run holds a lock on its first slot's log while it runs, which tells a running run
-from a killed one, and refuses a second run into the same outputs (exit 2). `--output`
-refuses names that `--output-dir` uses, such as `review-1.md`, so the two layouts never
-share files.
+The run holds a lock on its first slot's log while it runs, which refuses a second run
+into the same outputs (exit 2), and a lock of its own, which tells a running run from a
+killed one. `--output` refuses names that `--output-dir` uses, such as `review-1.md`, and
+names ending in `.status.json`, `.log` or `.patch`, so two runs never share files.
 
 A reviewer may add or change files in its snapshot. The wrapper returns them as
 `review-<n>.patch`, which applies to the reviewed checkout with `git apply`; it leaves
