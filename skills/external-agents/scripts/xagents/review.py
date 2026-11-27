@@ -21,32 +21,38 @@ import subprocess
 import sys
 import tempfile
 import time
+import traceback
 from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
+from . import sandbox
 from .backends import (
     AMP_PLUGINS,
     AMP_SETTINGS,
     BACKENDS,
+    CODER_CREDENTIALS,
     INSTALLERS,
     PROJECT_CONFIG,
     REVIEW_MODEL_REQUIRED,
     VIBE_QUIET,
+    coder_hosts,
     parse_agent,
 )
 from .common import (
     ENV_AMP_NO_CREDITS,
+    ENV_REVIEW_SANDBOX,
     ENV_REVIEWERS,
     UsageError,
     agent_env,
     installed,
     remove,
+    replace_atomically,
     run_with_timeouts,
     write_generated,
 )
-from .snapshot import Changes, base_diff, filter_patch, snapshot
+from .snapshot import Changes, base_diff, check_includes, filter_patch, snapshot
 
 PROMPT_FILE = "REVIEW_PROMPT.md"
 DIFF_FILE = "REVIEW_DIFF.patch"
@@ -57,6 +63,11 @@ INSTRUCTION = (
     "current directory and follow it. You may add or change files in the current directory, for "
     "example a regression test that demonstrates a finding; your changes are returned as a patch. "
     "Do not read or write files outside the current directory."
+)
+# Appended in the sandbox, where the reviewer has a shell.
+SANDBOX_INSTRUCTION = (
+    " You can run commands, such as the tests or a search, in a sandbox: the network reaches "
+    "only your model provider, so downloads fail."
 )
 UNAVAILABLE = re.compile(
     r"quota|credit|rate.?limit|insufficient|unauthori[sz]ed|forbidden|\b429\b|\b402\b|"
@@ -89,25 +100,13 @@ OPENCODE_REVIEWER = {
         }
     },
 }  # fmt: skip
+# In the sandbox, which confines commands itself, the reviewer also gets the shell.
+OPENCODE_SANDBOXED_REVIEWER = json.loads(json.dumps(OPENCODE_REVIEWER))
+OPENCODE_SANDBOXED_REVIEWER["agent"]["reviewer"]["tools"]["bash"] = True
+OPENCODE_SANDBOXED_REVIEWER["agent"]["reviewer"]["permission"]["bash"] = "allow"
 AMP_MODE = "external-reviewer"
-# A project plugin that registers a mode whose agent can only read, create, and edit
-# files. Amp offers no grep or glob tool to plugin agents; Read also lists directories.
-# apply_patch is left out because its paths are inside the patch text, where
-# permission rules cannot match them.
-AMP_FILE_TOOLS = ("Read", "create_file", "edit_file")
-AMP_PLUGIN = """\
-// @amp-agent-mode {{"key": "{mode}", "label": "{mode}"}}
-import type {{ PluginAPI }} from '@ampcode/plugin'
-
-export default function (amp: PluginAPI) {{
-	const agent = amp.createAgent({{
-		model: {model},
-		tools: {{ include: ['Read', 'create_file', 'edit_file'], exclude: ['tool_search', 'code_exec'] }},{effort}
-		instructions: 'You are a reviewer. You can read and change files in your working directory but cannot run commands.',
-	}})
-	amp.registerAgentMode({{ key: '{mode}', label: '{mode}', agent: agent.definition }})
-}}
-"""
+# The generated amp reviewer mode and the hook that confines it; see the file.
+AMP_PLUGIN = Path(__file__).with_name("amp_reviewer.js")
 
 # Vibe reads `VIBE_<SETTING>` variables over the user's and the project's config, so these
 # hold even when `~/.vibe/config.toml` allows more. With the `accept-edits` policy only
@@ -128,6 +127,13 @@ VIBE_REVIEWER_ENV = {
         for tool in ("bash", "git_bash", "powershell", "web_fetch", "web_search", "task")
     }),
 }  # fmt: skip
+# In the sandbox, which confines commands itself, `bash` runs without approval.
+VIBE_SANDBOXED_REVIEWER_ENV = VIBE_REVIEWER_ENV | {
+    "VIBE_TOOLS": json.dumps({
+        "bash": {"permission": "always"},
+        **{tool: {"permission": "never"} for tool in ("git_bash", "powershell", "web_fetch", "web_search", "task")},
+    }),
+}  # fmt: skip
 
 
 def snapshot_roots(snap: Path) -> list[str]:
@@ -136,23 +142,14 @@ def snapshot_roots(snap: Path) -> list[str]:
     return list(dict.fromkeys((str(snap.absolute()), str(snap.resolve()))))
 
 
-def amp_settings(snap: Path) -> dict[str, object]:
-    """Permissions that allow the file tools inside the snapshot and reject every other call.
-
-    Amp matches the path before normalizing it, so `..` segments are rejected first."""
-    paths = [pattern for root in snapshot_roots(snap) for pattern in (root, f"{root}/*")]
-    rules: list[dict[str, object]] = []
-    for tool in AMP_FILE_TOOLS:
-        rules.append({"tool": tool, "matches": {"path": r"/(^|\/)\.\.(\/|$)/"}, "action": "reject"})
-        rules.append({"tool": tool, "matches": {"path": paths}, "action": "allow"})
-    return {"amp.permissions": [*rules, {"tool": "*", "action": "reject"}]}
-
-
 # Reasoning efforts a reviewer spec may end in, as `@effort`. codex, opencode and amp pass
 # any of them to the provider, which accepts a subset per model; Claude Code accepts only
 # its own list and silently ignores anything else, so the wrapper checks that one.
 EFFORTS = ("none", "minimal", "low", "medium", "high", "xhigh", "max")
 BACKEND_EFFORTS = {"claude": ("low", "medium", "high", "xhigh", "max")}
+# A model at a high effort can think for minutes without printing a byte, which the idle
+# timeout would take for a stall; `--idle-timeout` is the silence allowed up to `medium`.
+EFFORT_IDLE_FACTOR = {"high": 2, "xhigh": 3, "max": 3}
 
 
 @dataclass(frozen=True)
@@ -160,6 +157,8 @@ class Reviewer:
     backend: str
     model: str | None
     effort: str | None = None
+    # Runs in the bubblewrap sandbox, with a shell; see `sandbox_reason`.
+    sandboxed: bool = False
 
     @property
     def label(self) -> str:
@@ -177,12 +176,24 @@ class Reviewer:
         """A free tier: daily limits, throttled when runs overlap."""
         return bool(self.model and self.model.endswith("-free"))
 
+    @property
+    def model_label(self) -> str:
+        """`backend[:model]`: free-tier limits apply to the model at any effort."""
+        return f"{self.backend}:{self.model}" if self.model else self.backend
+
+    def idle_timeout(self, base: float) -> float:
+        return base * EFFORT_IDLE_FACTOR.get(self.effort or "", 1)
+
     def command(self, snap: Path, instruction: str, last_message: Path) -> list[str]:
         model = ["--model", self.model] if self.model else []
         if self.backend == "codex":
             effort = ["-c", f'model_reasoning_effort="{self.effort}"'] if self.effort else []
+            # codex's own sandbox cannot start inside bubblewrap, which already confines it.
+            confined = (
+                ["--dangerously-bypass-approvals-and-sandbox"] if self.sandboxed else ["--sandbox", "workspace-write"]
+            )
             return [
-                "codex", "exec", "--sandbox", "workspace-write", "--skip-git-repo-check",
+                "codex", "exec", *confined, "--skip-git-repo-check",
                 "--color", "never", "--cd", str(snap),
                 "--output-last-message", str(last_message), *model, *effort, instruction,
             ]  # fmt: skip
@@ -191,10 +202,20 @@ class Reviewer:
             # while dontAsk denies those once the rule is absent. An `Edit` rule covers every
             # file-editing tool; `//` starts an absolute path.
             edits = [f"Edit(/{root}/**)" for root in snapshot_roots(snap)]
+            if self.sandboxed:
+                tools = ["--tools", "Read,Glob,Grep,Edit,Write,Bash", "--dangerously-skip-permissions"]
+            else:
+                tools = [
+                    "--tools",
+                    "Read,Glob,Grep,Edit,Write",
+                    "--permission-mode",
+                    "dontAsk",
+                    "--allowedTools",
+                    *edits,
+                ]
             return [
                 # User settings only: project settings in the reviewed tree could add hooks.
-                "claude", "-p", "--tools", "Read,Glob,Grep,Edit,Write", "--permission-mode", "dontAsk",
-                "--allowedTools", *edits, "--strict-mcp-config", "--setting-sources", "user",
+                "claude", "-p", *tools, "--strict-mcp-config", "--setting-sources", "user",
                 "--no-session-persistence", *model, *(["--effort", self.effort] if self.effort else []),
                 "--", instruction,
             ]  # fmt: skip
@@ -221,15 +242,23 @@ class Reviewer:
             "opencode", "run", "--dir", str(snap), "-m", str(self.model), "--agent", "reviewer", *effort, instruction,
         ]  # fmt: skip
 
+    def extra_env(self) -> dict[str, str]:
+        if self.backend != "vibe":
+            return {}
+        return VIBE_SANDBOXED_REVIEWER_ENV if self.sandboxed else VIBE_REVIEWER_ENV
+
     def env(self, snap: Path) -> dict[str, str]:
-        extra = VIBE_REVIEWER_ENV if self.backend == "vibe" else {}
-        return agent_env(snap, self.backend) | extra
+        return agent_env(snap, self.backend, self.model) | self.extra_env()
+
+    @property
+    def generated_paths(self) -> tuple[Path, ...]:
+        """The configuration the wrapper writes into the snapshot for this backend."""
+        return {"opencode": (Path("opencode.json"),), "amp": (AMP_PLUGINS.parent,)}.get(self.backend, ())
 
     @property
     def owned_paths(self) -> tuple[Path, ...]:
         """Paths the wrapper removes or generates for this backend, never the reviewer's changes."""
-        generated = {"opencode": (Path("opencode.json"),), "amp": (AMP_PLUGINS, AMP_SETTINGS)}
-        return (*PROJECT_CONFIG.get(self.backend, ()), *generated.get(self.backend, ()))
+        return (*PROJECT_CONFIG.get(self.backend, ()), *self.generated_paths)
 
     def prepare(self, snap: Path) -> None:
         """Write the backend's confined agent configuration into the snapshot.
@@ -239,15 +268,25 @@ class Reviewer:
         for relative in PROJECT_CONFIG.get(self.backend, ()):
             remove(snap / relative)
         if self.backend == "opencode":
-            write_generated(snap / "opencode.json", json.dumps(OPENCODE_REVIEWER, indent=2))
+            config = OPENCODE_SANDBOXED_REVIEWER if self.sandboxed else OPENCODE_REVIEWER
+            write_generated(snap / "opencode.json", json.dumps(config, indent=2))
         elif self.backend == "amp":
+            # The reviewed tree may hold `.amp` as a file or a link; the generated mode
+            # must land in a real directory inside the snapshot.
+            amp_dir = snap / AMP_PLUGINS.parent
+            if amp_dir.is_symlink() or not amp_dir.is_dir():
+                remove(amp_dir)
             plugins = snap / AMP_PLUGINS
             plugins.mkdir(parents=True)
-            model = json.dumps(self.model)
             effort = f"\n\t\treasoningEffort: {json.dumps(self.effort)}," if self.effort else ""
-            plugin = AMP_PLUGIN.format(mode=AMP_MODE, model=model, effort=effort)
+            root = json.dumps(str(snap.absolute()))
+            shell = json.dumps(self.sandboxed)
+            values = {"MODE": AMP_MODE, "MODEL": json.dumps(self.model), "EFFORT": effort, "ROOT": root, "SHELL": shell}
+            plugin = re.sub(r"__([A-Z]+)__", lambda match: values[match[1]], AMP_PLUGIN.read_text())
             write_generated(plugins / f"{AMP_MODE}.ts", plugin)
-            write_generated(snap / AMP_SETTINGS, json.dumps(amp_settings(snap), indent=2))
+            # Passed as `--settings-file`, so neither the user's settings nor a copy from
+            # the reviewed tree apply to the reviewer.
+            write_generated(snap / AMP_SETTINGS, "{}\n")
 
 
 def parse_reviewer(spec: str) -> Reviewer:
@@ -357,15 +396,15 @@ def _ledger() -> dict[str, dict[str, str]]:
 
 
 def limited_today(reviewer: Reviewer) -> bool:
-    return _ledger().get(reviewer.label, {}).get("date") == _today()
+    return _ledger().get(reviewer.model_label, {}).get("date") == _today()
 
 
 def mark_limited(reviewer: Reviewer, reason: str) -> None:
     """Skip a free model for the rest of the UTC day; free limits reset daily."""
     state_dir().mkdir(parents=True, exist_ok=True)
     ledger = _ledger()
-    ledger[reviewer.label] = {"date": _today(), "reason": reason}
-    (state_dir() / "limits.json").write_text(json.dumps(ledger, indent=2))
+    ledger[reviewer.model_label] = {"date": _today(), "reason": reason}
+    replace_atomically(state_dir() / "limits.json", json.dumps(ledger, indent=2))
 
 
 def amp_output(code: int, raw: str) -> str:
@@ -397,7 +436,11 @@ def amp_output(code: int, raw: str) -> str:
             continue
         if event.get("type") != "assistant":
             continue
-        for block in event.get("message", {}).get("content", []):
+        message = event.get("message")
+        content = message.get("content") if isinstance(message, dict) else None
+        for block in content if isinstance(content, list) else []:
+            if not isinstance(block, dict):
+                continue
             if block.get("type") == "tool_use":
                 lines.append(f"tool {block.get('name')} {json.dumps(block.get('input'))[:200]}")
             elif block.get("type") == "text":
@@ -444,32 +487,157 @@ def vibe_output(code: int, raw: str) -> str:
     return "\n".join(lines) if events else raw
 
 
+def amp_session(raw: str) -> str | None:
+    """The Amp thread of a run, from the first `amp --stream-json` event that names it."""
+    for line in raw.splitlines():
+        with contextlib.suppress(ValueError):
+            event = json.loads(line)
+            if isinstance(event, dict) and isinstance(event.get("session_id"), str):
+                return event["session_id"]
+    return None
+
+
+def amp_thread_state(thread: str, cwd: Path, env: dict[str, str], timeout: float = 60) -> tuple[str, str | None]:
+    """What the Amp server says about a run's thread, which keeps running when the CLI is
+    silent or gone: `working` while a model turn is in flight, `answered` with the final
+    text once a turn ended without a tool call, `stopped` after a turn that ended asking
+    for a tool, which only the CLI runs, or `unknown` when the thread cannot be read."""
+    if timeout <= 0:
+        return "unknown", None
+    try:
+        result = subprocess.run(
+            ["amp", "threads", "export", thread], cwd=cwd, env=env, capture_output=True, timeout=timeout, check=False
+        )
+        export = json.loads(result.stdout)
+    except (OSError, subprocess.TimeoutExpired, ValueError):
+        return "unknown", None
+    messages = export.get("messages") if isinstance(export, dict) else None
+    last = messages[-1] if isinstance(messages, list) and messages else None
+    if not isinstance(last, dict):
+        return "unknown", None
+    state = last.get("state")
+    if last.get("role") != "assistant" or state is None:
+        return "working", None
+    if not isinstance(state, dict):
+        return "unknown", None
+    if state.get("type") != "complete":
+        return "working", None
+    content = last.get("content")
+    texts = [
+        b["text"] for b in (content if isinstance(content, list) else []) if isinstance(b, dict)
+        and b.get("type") == "text" and isinstance(b.get("text"), str)
+    ]  # fmt: skip
+    text = "\n\n".join(texts)
+    if state.get("stopReason") == "end_turn" and text.strip():
+        return "answered", text
+    return "stopped", None
+
+
+# How many idle periods an `amp` run may stay silent while its turn is still in flight on
+# the server, beyond the first: a model thinking at length prints nothing until it answers,
+# while a request that never returns would otherwise hold the run until the total timeout.
+AMP_IDLE_EXTENSIONS = 2
+
+
+class AmpWatch:
+    """Consults the server when an `amp` run goes silent. A turn still in flight earns more
+    time; a turn the server finished while the CLI printed nothing is taken as the answer."""
+
+    def __init__(self, cwd: Path, env: dict[str, str], log: Path) -> None:
+        self.cwd, self.env, self.log = cwd, env, log
+        self.extensions = 0
+        self.thread: str | None = None
+        self.answer: str | None = None
+
+    def note(self, message: str) -> None:
+        with self.log.open("a") as out:
+            out.write(f"\n[{message}]\n")
+
+    def on_idle(self, output: str, remaining: float) -> bool:
+        self.thread = self.thread or amp_session(output)
+        if self.thread is None:
+            return False
+        # The check must not carry the run past its total deadline.
+        state, text = amp_thread_state(self.thread, self.cwd, self.env, timeout=min(60.0, remaining))
+        if state == "answered":
+            self.answer = text
+            self.note(f"the server finished {self.thread} while the CLI was silent; taking its answer")
+            return False
+        if state == "working" and self.extensions < AMP_IDLE_EXTENSIONS:
+            self.extensions += 1
+            self.note(f"silent, but {self.thread} is still working on the server; waiting another idle period")
+            return True
+        return False
+
+
 def attempt(
     reviewer: Reviewer, pristine: Path, instruction: str, total: float, idle: float, log: Path
 ) -> tuple[int, str, bytes]:
     """Run one reviewer on a fresh copy of `pristine`, appending its raw output to `log`.
 
-    Returns its exit code, its output, and a Git patch of the files it changed."""
+    Returns the exit code, the output, and a Git patch of the files the reviewer changed."""
     snap = pristine.parent / "snapshot"
     remove(snap)
     shutil.copytree(pristine, snap, symlinks=True)
     reviewer.prepare(snap)
-    # The recording repository sits next to the snapshot, outside the reviewer's reach.
-    changes = Changes(pristine.parent / "changes.git", snap, (*HANDOFF_FILES, *reviewer.owned_paths))
+    # The repository that records the changes lives under the state directory, outside
+    # every directory a reviewer may write: `codex --sandbox workspace-write` allows /tmp.
+    state_dir().mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="record-", dir=state_dir()) as record:
+        return run_attempt(reviewer, snap, Path(record), instruction, total, idle, log)
+
+
+@contextlib.contextmanager
+def sandboxed(
+    reviewer: Reviewer, snap: Path, record: Path, messages: Path, command: list[str]
+) -> Iterator[tuple[list[str], tuple[int, ...]]]:
+    """`command` wrapped to run in the coding sandbox on the snapshot, and the descriptors
+    it needs. The sandbox sees the snapshot, read-write except for the wrapper's generated
+    configuration, the directory for the last message, and the CLI with its login; its
+    network reaches only the model provider."""
+    mounts = sandbox.Mounts()
+    python = sandbox.python_for_forwarder(mounts)
+    executable = sandbox.bind_agent(reviewer.backend, reviewer.model, mounts)
+    # Running the tests must not leave caches that look like proposed changes.
+    mounts.env |= reviewer.extra_env() | {"PYTHONDONTWRITEBYTECODE": "1"}
+    mounts.protected = [str(snap / path) for path in reviewer.generated_paths if (snap / path).exists()]
+    mounts.rw.append((str(messages), str(messages)))
+    hosts = list(coder_hosts(reviewer.backend, reviewer.model))
+    # A run directory per attempt: slots run at once in one process.
+    (record / "sandbox").mkdir()
+    with sandbox.launch(snap, record / "sandbox", mounts, hosts, python, {}, ask=False) as (launcher, fds, _):
+        yield [*launcher, executable, *command[1:]], fds
+
+
+def run_attempt(
+    reviewer: Reviewer, snap: Path, record: Path, instruction: str, total: float, idle: float, log: Path
+) -> tuple[int, str, bytes]:
+    changes = Changes(record / "changes.git", snap, (*HANDOFF_FILES, *reviewer.owned_paths))
     before = changes.tree()
     with log.open("a") as header:
         header.write(f"\n=== {reviewer.label} at {dt.datetime.now().astimezone():%H:%M:%S %Z}: {instruction[:60]}\n")
-    with tempfile.TemporaryDirectory(prefix="xagents-msg-") as tmp:
+    with tempfile.TemporaryDirectory(prefix="xagents-msg-") as tmp, contextlib.ExitStack() as stack:
         last_message = Path(tmp) / "last-message.md"
+        env = reviewer.env(snap)
+        command = reviewer.command(snap, instruction, last_message)
+        fds: tuple[int, ...] = ()
+        if reviewer.sandboxed:
+            command, fds = stack.enter_context(sandboxed(reviewer, snap, record, Path(tmp), command))
+        watch = AmpWatch(snap, env, log) if reviewer.backend == "amp" else None
         code, output = run_with_timeouts(
-            reviewer.command(snap, instruction, last_message),
+            command,
             snap,
             total,
-            idle if reviewer.idle_timeout_applies else None,
-            reviewer.env(snap),
+            reviewer.idle_timeout(idle) if reviewer.idle_timeout_applies else None,
+            # In the sandbox the launcher builds the agent's environment from scratch.
+            {"PATH": os.environ.get("PATH", "")} if reviewer.sandboxed else env,
             log,
+            on_idle=watch.on_idle if watch else None,
+            pass_fds=fds,
         )
-        if reviewer.backend == "amp":
+        if watch is not None and watch.answer is not None:
+            code, output = 0, watch.answer
+        elif reviewer.backend == "amp":
             output = amp_output(code, output)
         elif reviewer.backend == "vibe":
             output = vibe_output(code, output)
@@ -482,11 +650,17 @@ def attempt(
         return code, f"{output.rstrip()}\n\nThe wrapper could not record the reviewer's file changes: {error}\n", b""
 
 
+# The preflight reply: the last line of the output, so a CLI that only echoes the prompt
+# does not pass.
+PONG = re.compile(r"\W*PONG\W*", re.IGNORECASE)
+
+
 def preflight(reviewer: Reviewer, pristine: Path, log: Path, timeout: float = 90, attempts: int = 2) -> bool:
     """A short call that catches missing auth or exhausted quota, which can otherwise hang."""
     for number in range(1, attempts + 1):
         code, output, _ = attempt(reviewer, pristine, "Reply with exactly: PONG", timeout, timeout, log)
-        if code == 0 and "PONG" in output:
+        lines = [line for line in output.splitlines() if line.strip()]
+        if code == 0 and lines and PONG.fullmatch(lines[-1].strip()):
             return True
         tail = " ".join(output.split())[-300:]
         print(f"{reviewer.label}: preflight {number}/{attempts} failed (exit {code}): {tail}", file=sys.stderr)
@@ -507,7 +681,14 @@ def amp_credit_problem(reviewer: Reviewer, cwd: Path, log: Path, timeout: float 
         out.write(f"\n=== {reviewer.label}: model routing check\n")
     try:
         result = subprocess.run(
-            command, cwd=cwd, capture_output=True, text=True, errors="replace", timeout=timeout, check=False
+            command,
+            cwd=cwd,
+            env=agent_env(cwd, "amp"),
+            capture_output=True,
+            text=True,
+            errors="replace",
+            timeout=timeout,
+            check=False,
         )
     except subprocess.TimeoutExpired as error:
         partial = b"".join(p if isinstance(p, bytes) else p.encode() for p in (error.stdout, error.stderr) if p)
@@ -580,13 +761,17 @@ def review_with_fallback(
             if options.preflight and not preflight(reviewer, pristine, run_log):
                 log.append(f"{reviewer.label}: preflight failed")
                 continue
-            code, output, changes = attempt(reviewer, pristine, INSTRUCTION, options.total, options.idle, run_log)
+            instruction = INSTRUCTION + (SANDBOX_INSTRUCTION if reviewer.sandboxed else "")
+            code, output, changes = attempt(reviewer, pristine, instruction, options.total, options.idle, run_log)
             state = classify(code, output, options.expect)
             if state == "stalled" and not reviewer.free:
-                # A paid model's request can hang without failing; a fresh run usually
-                # completes. Free tiers stall from throttling, so they are not retried.
+                # A paid model's request can hang without failing, and a model can think
+                # longer than the idle timeout: the fresh run may stay silent twice as long.
+                # Free tiers stall from throttling, so they are not retried.
                 print(f"{reviewer.label}: stalled (exit {code}); retrying once.", file=sys.stderr)
-                code, output, changes = attempt(reviewer, pristine, INSTRUCTION, options.total, options.idle, run_log)
+                code, output, changes = attempt(
+                    reviewer, pristine, instruction, options.total, 2 * options.idle, run_log
+                )
                 state = classify(code, output, options.expect)
             if reviewer.free and state in ("stalled", "unavailable"):
                 # Free tiers rarely say "limit": a stall or a failure stops spending runs on
@@ -609,21 +794,29 @@ def review_with_fallback(
 
 
 def review_slot(
-    slot: Slot, args: argparse.Namespace, source: Path, files: dict[str, str], run_log: Path
+    slot: Slot, args: argparse.Namespace, source: Path, files: dict[str, str], exclude: list[Path], run_log: Path
 ) -> tuple[Reviewer | None, str, bytes]:
     """Run one slot on its own snapshots, since backends and reviewers write into them.
 
     Every attempt starts from the same pristine copy, so a failed reviewer's changes do
-    not reach the next one. Every run's raw output goes to `run_log` as it arrives."""
+    not reach the next one. Every run's raw output goes to `run_log` as it arrives. A
+    failure of the wrapper itself ends only this slot."""
     if not slot.reviewers:
         return None, "no backend is installed or configured", b""
     options = Options(args.timeout, args.idle_timeout, not args.no_preflight, args.expect)
-    with tempfile.TemporaryDirectory(prefix="xagents-review-") as tmp:
-        pristine = Path(tmp) / "pristine"
-        snapshot(source, pristine, args.include)
-        for name, content in files.items():
-            write_generated(pristine / name, content)
-        return review_with_fallback(list(slot.reviewers), pristine, options, run_log)
+    try:
+        with tempfile.TemporaryDirectory(prefix="xagents-review-") as tmp:
+            pristine = Path(tmp) / "pristine"
+            snapshot(source, pristine, args.include, exclude)
+            for name, content in files.items():
+                write_generated(pristine / name, content)
+            return review_with_fallback(list(slot.reviewers), pristine, options, run_log)
+    except Exception as error:
+        # Any wrapper failure, a bug included: the other slots' reviews are still written,
+        # and the traceback goes to this slot's log.
+        with run_log.open("a") as out:
+            out.write(f"\nwrapper error:\n{traceback.format_exc()}")
+        return None, f"the wrapper failed while running this slot: {error}", b""
 
 
 def output_paths(args: argparse.Namespace, count: int) -> list[Path]:
@@ -632,6 +825,8 @@ def output_paths(args: argparse.Namespace, count: int) -> list[Path]:
             raise UsageError(f"--output must not end in {args.output.suffix}; the wrapper writes that file")
         if count != 1:
             raise UsageError(f"the panel has {count} slots; pass --output-dir instead of --output")
+        if not args.output.parent.is_dir():
+            raise UsageError(f"cannot use --output {args.output}: {args.output.parent} is not a directory")
         return [args.output]
     try:
         args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -652,6 +847,19 @@ def detect_reviewers() -> dict[str, object]:
     }
 
 
+def sandbox_if_possible(reviewer: Reviewer) -> Reviewer:
+    """The reviewer in the sandbox, unless it could not log in there.
+
+    An amp signed in some other way, such as an Amp orb's thread identity, would wait for a
+    device login in the sandbox until the run times out."""
+    if reviewer.backend == "amp" and not (
+        os.environ.get("AMP_API_KEY") or any((sandbox.HOME / path).is_file() for path in CODER_CREDENTIALS["amp"])
+    ):
+        print(f"{reviewer.label}: no AMP_API_KEY or amp login file; it runs with file tools only.", file=sys.stderr)
+        return reviewer
+    return replace(reviewer, sandboxed=True)
+
+
 def review(args: argparse.Namespace) -> int:
     source = args.source.resolve()
     if not args.prompt_file.is_file():
@@ -661,17 +869,38 @@ def review(args: argparse.Namespace) -> int:
     panel = resolve_panel(args.reviewer, args.reviewers, os.environ.get(ENV_REVIEWERS))
     if not panel:
         raise UsageError(f"no external reviewer is configured; set {ENV_REVIEWERS} or pass --reviewers")
+    if os.environ.get(ENV_REVIEW_SANDBOX) == "1":
+        if reason := sandbox.unavailable():
+            print(f"{ENV_REVIEW_SANDBOX}: {reason}; reviewers run with file tools only.", file=sys.stderr)
+        else:
+            panel = [Slot(tuple(map(sandbox_if_possible, slot.reviewers)), slot.optional) for slot in panel]
+    # Validated here, before the slots run, so a bad --include is a usage error (exit 2).
+    check_includes(source, args.include)
     paths = output_paths(args, len(panel))
+    # The review's own inputs and outputs stay out of what the reviewers see: the supplied
+    # diff only after filtering, and no earlier review or its patch.
+    exclude = [
+        *([args.diff_file] if args.diff_file else []),
+        *(path.with_suffix(suffix) for path in paths for suffix in (".md", ".log", ".patch")),
+        *paths,
+    ]
     files = {PROMPT_FILE: args.prompt_file.read_text()}
-    patch = base_diff(source, args.base) if args.base else args.diff_file.read_text() if args.diff_file else None
+    if args.base:
+        patch = base_diff(source, args.base, exclude)
+    elif args.diff_file:
+        patch = args.diff_file.read_bytes().decode(errors="surrogateescape")
+    else:
+        patch = None
     if patch is not None:
         files[DIFF_FILE], files[FILES_FILE] = filter_patch(patch)
     logs = [path.with_suffix(".log") for path in paths]
-    for log in logs:
+    for path, log in zip(paths, logs, strict=True):
         log.write_text("")
+        # A patch left by an earlier review next to this output would look like this one's.
+        path.with_suffix(".patch").unlink(missing_ok=True)
     print(f"raw reviewer output, written as it arrives: {', '.join(map(str, logs))}", file=sys.stderr)
     with ThreadPoolExecutor(max_workers=len(panel)) as pool:
-        results = list(pool.map(lambda slot, log: review_slot(slot, args, source, files, log), panel, logs))
+        results = list(pool.map(lambda slot, log: review_slot(slot, args, source, files, exclude, log), panel, logs))
     complete = True
     for number, (slot, path, (reviewer, output, changes)) in enumerate(
         zip(panel, paths, results, strict=True), start=1
@@ -723,5 +952,11 @@ def add_parser(commands: argparse._SubParsersAction) -> None:
     chosen.add_argument("--reviewers", help=f"A whole panel in {ENV_REVIEWERS} syntax; overrides it")
     run.add_argument("--expect", type=expect_pattern, help="Regex a usable review must match, such as a verdict line")
     run.add_argument("--timeout", type=float, default=1800)
-    run.add_argument("--idle-timeout", type=float, default=300)
+    run.add_argument(
+        "--idle-timeout",
+        type=float,
+        default=300,
+        help="Seconds of silence before a reviewer counts as stalled, up to effort medium; "
+        "high doubles it, xhigh and max triple it",
+    )
     run.add_argument("--no-preflight", action="store_true")

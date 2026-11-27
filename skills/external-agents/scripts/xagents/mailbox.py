@@ -18,6 +18,7 @@ from __future__ import annotations
 import contextlib
 import datetime as dt
 import json
+import math
 import os
 import select
 import socket
@@ -29,7 +30,7 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from .common import UsageError
+from .common import UsageError, bind_unix
 
 MAX_QUESTION = 16 * 1024
 MAX_REQUEST = 64 * 1024
@@ -142,20 +143,6 @@ class Mailbox:
             self.changed.notify_all()
 
 
-def bind_unix(path: Path) -> socket.socket:
-    """A listening socket at `path`; a relative name keeps long run paths under the
-    108-byte socket path limit. Called before any server thread starts."""
-    server = socket.socket(socket.AF_UNIX)
-    cwd = os.getcwd()
-    os.chdir(path.parent)
-    try:
-        server.bind(path.name)
-    finally:
-        os.chdir(cwd)
-    server.listen(MAX_CLIENTS)
-    return server
-
-
 def receive_exactly(conn: socket.socket, size: int, deadline: float) -> bytes | None:
     data = b""
     while len(data) < size:
@@ -191,39 +178,54 @@ def receive_line(conn: socket.socket, deadline: float) -> bytes | None:
     return line if newline and len(line) <= MAX_REQUEST else None
 
 
+def valid_timeout(timeout: object) -> bool:
+    """None, or a finite number of seconds a lock can wait: `inf` overflows `Condition.wait`
+    and `nan` makes it spin."""
+    if timeout is None:
+        return True
+    return (
+        isinstance(timeout, (int, float))
+        and not isinstance(timeout, bool)
+        and math.isfinite(timeout)
+        and 0 <= timeout <= threading.TIMEOUT_MAX
+    )
+
+
 class Server:
     """Serves the agent socket and the control socket until `close`."""
 
     def __init__(self, mailbox: Mailbox, ask_path: Path, control_path: Path) -> None:
         self.mailbox = mailbox
         self.control_path = control_path
-        self.slots = threading.BoundedSemaphore(2 * MAX_CLIENTS)
-        self.sockets = [bind_unix(ask_path), bind_unix(control_path)]
+        self.sockets = [bind_unix(ask_path, MAX_CLIENTS), bind_unix(control_path, MAX_CLIENTS)]
         self.handlers = (self.serve_asker, self.serve_control)
 
     def start(self) -> None:
+        # Each socket has its own connection limit: the agent, which can open as many
+        # connections to its socket as it likes, must not lock the coordinator out.
         for listener, handler in zip(self.sockets, self.handlers, strict=True):
-            threading.Thread(target=self.accept, args=(listener, handler), daemon=True).start()
+            slots = threading.BoundedSemaphore(MAX_CLIENTS)
+            threading.Thread(target=self.accept, args=(listener, handler, slots), daemon=True).start()
 
-    def accept(self, listener: socket.socket, handler) -> None:
+    def accept(self, listener: socket.socket, handler, slots: threading.BoundedSemaphore) -> None:
         while True:
             try:
                 conn, _ = listener.accept()
             except OSError:
                 return
-            if not self.slots.acquire(blocking=False):
+            if not slots.acquire(blocking=False):
                 conn.close()
                 continue
-            threading.Thread(target=self.guarded, args=(handler, conn), daemon=True).start()
+            threading.Thread(target=self.guarded, args=(handler, conn, slots), daemon=True).start()
 
-    def guarded(self, handler, conn: socket.socket) -> None:
+    def guarded(self, handler, conn: socket.socket, slots: threading.BoundedSemaphore) -> None:
         try:
             with contextlib.closing(conn):
                 handler(conn)
         except OSError:
             pass
         finally:
-            self.slots.release()
+            slots.release()
 
     def serve_asker(self, conn: socket.socket) -> None:
         deadline = time.monotonic() + REQUEST_SECONDS
@@ -258,6 +260,8 @@ class Server:
             request = None
         if not isinstance(request, dict):
             reply: dict[str, object] = {"error": "malformed request"}
+        elif request.get("op") == "question" and not valid_timeout(request.get("timeout")):
+            reply = {"error": f"timeout must be a number of seconds up to {threading.TIMEOUT_MAX:.0f}"}
         elif request.get("op") == "question":
             timeout = request.get("timeout")
             wait = bool(request.get("wait"))
@@ -288,8 +292,8 @@ class NotRunning(Exception):
     """No agent run is serving the mailbox."""
 
 
-def latest_run(state: Path) -> int:
-    """The latest run directory, opened without following links below `state`."""
+def latest_run(state: Path) -> tuple[str, int]:
+    """The latest run's name and directory, opened without following links below `state`."""
     try:
         # The coordinator may start waiting before the launcher creates the directory.
         state_fd = os.open(state, os.O_RDONLY | os.O_DIRECTORY)
@@ -303,15 +307,20 @@ def latest_run(state: Path) -> int:
         if "/" in latest or not latest.startswith("run-"):
             raise UsageError("latest run link is not a run directory")
         try:
-            return os.open(latest, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=state_fd)
+            return latest, os.open(latest, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=state_fd)
         except FileNotFoundError as error:
             raise NotRunning("the latest run directory was removed") from error
     finally:
         os.close(state_fd)
 
 
-def request(state: Path, message: dict[str, object]) -> dict[str, object]:
-    run_fd = latest_run(state)
+def request(state: Path, message: dict[str, object], run: str | None = None) -> dict[str, object]:
+    """Send one request to the latest run's mailbox; with `run`, only if that run is still
+    the latest, so a request meant for an earlier run never reaches a newer one."""
+    name, run_fd = latest_run(state)
+    if run is not None and run != name:
+        os.close(run_fd)
+        raise UsageError(f"{run} is no longer the latest run; the latest is {name}")
     client = socket.socket(socket.AF_UNIX)
     cwd = os.open(".", os.O_RDONLY | os.O_DIRECTORY)
     try:
@@ -329,15 +338,19 @@ def request(state: Path, message: dict[str, object]) -> dict[str, object]:
             raise NotRunning("the latest run has ended") from error
         finally:
             os.fchdir(cwd)
-        client.sendall(json.dumps(message).encode() + b"\n")
         data = b""
-        while chunk := client.recv(65536):
-            data += chunk
-            if b"\n" in data:
-                break
+        try:
+            client.sendall(json.dumps(message).encode() + b"\n")
+            while chunk := client.recv(65536):
+                data += chunk
+                if b"\n" in data:
+                    break
+        except (ConnectionResetError, BrokenPipeError) as error:
+            raise UsageError(f"the mailbox dropped the request ({error}); try again") from error
         if b"\n" not in data:
             raise NotRunning("the run ended while waiting")
         reply = json.loads(data.partition(b"\n")[0])
+        reply["run"] = name
         if "error" in reply:
             raise UsageError(f"the mailbox refused the request: {reply['error']}")
         return reply
@@ -361,8 +374,11 @@ def question(state: Path, wait: bool, timeout: float | None) -> int:
         return EXIT_NOT_RUNNING
     text = reply.get("question")
     if isinstance(text, str):
-        # The id goes to stderr, so stdout is exactly the agent's text.
-        print(f"xagents: question {reply.get('id')}", file=sys.stderr)
+        # The id goes to stderr, so stdout is exactly the agent's text. The token for
+        # `--to` names the run too, so a late answer cannot reach a newer run.
+        print(
+            f"xagents: question {reply.get('id')}, answer with --to {reply['run']}:{reply.get('id')}", file=sys.stderr
+        )
         print(text, end="" if text.endswith("\n") else "\n")
         return 0
     if not reply.get("running"):
@@ -371,11 +387,21 @@ def question(state: Path, wait: bool, timeout: float | None) -> int:
     return 1
 
 
-def answer(state: Path, text: str, to: int | None) -> int:
+def parse_question_id(token: str) -> tuple[str | None, int]:
+    """`ID` or `RUN:ID`, as `question` prints it."""
+    run, _, number = token.rpartition(":")
+    try:
+        return run or None, int(number)
+    except ValueError as error:
+        raise UsageError(f"--to {token!r} is not a question id such as 3 or run-...:3") from error
+
+
+def answer(state: Path, text: str, to: str | None) -> int:
     """Answer the oldest question (question `to`, when given): 0 when delivered, 4 when no
     run is active; a usage error when nothing, or not that question, is waiting."""
+    run, number = parse_question_id(to) if to is not None else (None, None)
     try:
-        reply = request(state, {"op": "answer", "text": text, "to": to})
+        reply = request(state, {"op": "answer", "text": text, "to": number}, run)
     except NotRunning as error:
         print(f"xagents: {error}", file=sys.stderr)
         return EXIT_NOT_RUNNING

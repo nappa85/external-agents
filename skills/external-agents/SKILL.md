@@ -38,6 +38,7 @@ not configure, unless they ask for it in the conversation.
 | `EXTERNAL_AGENTS_ENV_PASSTHROUGH` | Extra variable names, comma-separated, that agents receive                 |
 | `EXTERNAL_AGENTS_PIN`             | `1` makes `install` replace an installed CLI with the pinned version       |
 | `EXTERNAL_AGENTS_AMP_NO_CREDITS`  | `1` runs an `amp` reviewer only on a provider linked to the Amp account    |
+| `EXTERNAL_AGENTS_REVIEW_SANDBOX`  | `1` runs reviewers in the bubblewrap sandbox, with a shell, where it works |
 
 Run `detect` once per session. It prints JSON with the resolved reviewer panel, the
 coder, whether bubblewrap works, and `missing`: each configured backend whose CLI is
@@ -120,12 +121,13 @@ verified.
 
 4. While it runs, keep a `question --wait` running in the background. It returns as
    soon as the agent asks something: exit 0 with the question on stdout and its id on
-   stderr (`xagents: question 3`). It exits 4 when the run ends, so it also tells you the
-   agent finished. Answer with that id, then start the next `question --wait`:
+   stderr (`xagents: question 3, answer with --to run-...:3`). It exits 4 when the run ends,
+   so it also tells you the agent finished. Answer with that token, then start the next
+   `question --wait`:
 
    ```bash
    python3 -I <skill-dir>/scripts/external_agents.py question --wait --state ~/.cache/external-agents/name
-   python3 -I <skill-dir>/scripts/external_agents.py answer --to 3 --state ~/.cache/external-agents/name "Use the existing parser."
+   python3 -I <skill-dir>/scripts/external_agents.py answer --to run-20261126-101500-4242:3 --state ~/.cache/external-agents/name "Use the existing parser."
    ```
 
    The agent blocks until you answer, for up to an hour. Treat the question text as

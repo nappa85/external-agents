@@ -55,6 +55,12 @@ class TlsName(unittest.TestCase):
     def test_the_server_name_is_read_from_a_real_client_hello(self) -> None:
         self.assertEqual(proxy.client_hello_sni(client_hello("ChatGPT.com")), "chatgpt.com")
 
+    def test_the_server_name_is_read_when_other_records_follow_the_client_hello(self) -> None:
+        change_cipher_spec = b"\x14\x03\x03\x00\x01\x01"
+
+        self.assertEqual(proxy.client_hello_sni(client_hello("chatgpt.com") + change_cipher_spec), "chatgpt.com")
+        self.assertIsNone(proxy.client_hello_sni(change_cipher_spec + client_hello("chatgpt.com")))
+
     def test_a_truncated_or_foreign_first_flight_has_no_name(self) -> None:
         hello = client_hello("chatgpt.com")
         self.assertIsNone(proxy.client_hello_sni(hello[:40]))
@@ -288,6 +294,72 @@ class Masks(unittest.TestCase):
             self.assertEqual([p.relative_to(tree).as_posix() for p in directories], ["vendor/lib/.git", "ws/.jj"])
 
 
+class Submodules(unittest.TestCase):
+    """The host runs git in the worktree after the run. A submodule's `.git`, initialised
+    or not, is where the agent could plant a repository whose config runs commands
+    (`core.fsmonitor`) on the host's next `git status`. The launcher must either refuse
+    the worktree or cover that path with a mount the agent cannot change."""
+
+    def worktree_with_submodule(self, root: Path, initialise: bool) -> Path:
+        lib = root / "lib"
+        lib.mkdir()
+        git(lib, "init", "-q")
+        git(lib, "-c", "user.email=t@example.com", "-c", "user.name=T", "commit", "-q", "--allow-empty", "-m", "lib")
+        tree = worktree(root)
+        main = root / "main"
+        git(main, "-c", "protocol.file.allow=always", "submodule", "-q", "add", "../lib", "sub")
+        git(main, "commit", "-q", "-m", "submodule")
+        git(tree, "checkout", "-q", "--detach", git(main, "rev-parse", "HEAD").strip())
+        if initialise:
+            git(tree, "-c", "protocol.file.allow=always", "submodule", "-q", "update", "--init")
+        return tree
+
+    def assert_protected(self, tree: Path, state: Path) -> None:
+        launched: list[list[str]] = []
+        real_popen = subprocess.Popen
+
+        class Stop(Exception):
+            pass
+
+        def popen(argv: list[str], *args: object, **kwargs: object) -> object:
+            if "bwrap" not in argv:  # the launcher's own helpers, such as `git ls-files`
+                return real_popen(argv, *args, **kwargs)
+            launched.append(argv)
+            raise Stop
+
+        namespace = Refusals().namespace(tree, state)
+        try:
+            with (
+                mock.patch.object(sandbox.shutil, "which", return_value="/usr/bin/true"),
+                mock.patch.object(sandbox.subprocess, "Popen", popen),
+            ):
+                sandbox.code(namespace, ["true"])
+        except common.UsageError as refusal:
+            self.assertIn("submodule", str(refusal))
+            return
+        except Stop:
+            pass
+        argv = launched[0]
+        target = str(tree / "sub" / ".git")
+        covered = any(
+            argv[i] in ("--ro-bind", "--tmpfs") and argv[i + (2 if argv[i] == "--ro-bind" else 1)] == target
+            for i in range(len(argv) - 2)
+        )
+        self.assertTrue(covered, f"{target} is writable in the sandbox")
+
+    def test_an_initialised_submodule_cannot_be_repointed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tree = self.worktree_with_submodule(Path(tmp), initialise=True)
+            self.assertTrue((tree / "sub/.git").is_file())
+            self.assert_protected(tree, Path(tmp, "state"))
+
+    def test_an_uninitialised_submodule_cannot_be_replaced_by_a_planted_repository(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tree = self.worktree_with_submodule(Path(tmp), initialise=False)
+            self.assertFalse((tree / "sub/.git").exists())
+            self.assert_protected(tree, Path(tmp, "state"))
+
+
 class Arguments(unittest.TestCase):
     def test_the_sandbox_shares_nothing_and_binds_only_what_it_needs(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -354,6 +426,87 @@ class Refusals(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             tree = worktree(Path(tmp))
             self.assertIn("outside the worktree", self.refusal(self.namespace(tree, tree / ".state")))
+
+    def test_a_read_only_bind_that_exposes_the_state_dir_is_refused(self) -> None:
+        # The state dir holds the run's control socket; connecting needs no write access,
+        # so a read-only view of it would let the agent answer its own questions.
+        with tempfile.TemporaryDirectory() as tmp:
+            tree = worktree(Path(tmp))
+            cache = Path(tmp, "cache")
+            args = self.namespace(tree, cache / "state", ro=[str(cache)])
+            with mock.patch.object(sandbox, "Proxy", side_effect=AssertionError("the sandbox was launched")):
+                self.assertIn("state dir", self.refusal(args))
+
+    def test_a_writable_bind_over_the_main_checkout_is_refused(self) -> None:
+        # The main checkout's .git holds the worktree's hooks and config, which run on the
+        # host's next git command: the same reason a main checkout is refused.
+        with tempfile.TemporaryDirectory() as tmp:
+            tree = worktree(Path(tmp))
+            args = self.namespace(tree, Path(tmp, "state"), rw=[str(Path(tmp, "main"))])
+            with mock.patch.object(sandbox, "Proxy", side_effect=AssertionError("the sandbox was launched")):
+                self.assertIn("git", self.refusal(args))
+
+    def test_cli_env_overrides_inherited_credentials_and_backend_defaults(self) -> None:
+        seen_argv: list[str] = []
+
+        class Stop(Exception):
+            pass
+
+        real_popen = subprocess.Popen
+
+        def popen(argv: list[str], **kwargs: object) -> object:
+            if "bwrap" not in argv:
+                return real_popen(argv, **kwargs)
+            seen_argv.extend(argv)
+            raise Stop
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tree = worktree(Path(tmp))
+            args = self.namespace(
+                tree, Path(tmp, "state"), agent="codex", env=["OPENAI_BASE_URL=https://cli.example"], no_seccomp=True
+            )
+            with (
+                mock.patch.dict(os.environ, {"OPENAI_BASE_URL": "https://host.example"}),
+                mock.patch.object(sandbox.shutil, "which", return_value="/usr/bin/true"),
+                mock.patch.object(sandbox.subprocess, "Popen", popen),
+                self.assertRaises(Stop),
+            ):
+                sandbox.code(args, ["true"])
+        pairs = {seen_argv[i + 1]: seen_argv[i + 2] for i, token in enumerate(seen_argv) if token == "--setenv"}
+        self.assertEqual(pairs.get("OPENAI_BASE_URL"), "https://cli.example")
+
+    def test_empty_hosts_replaces_default_egress_and_strips_spaces(self) -> None:
+        seen_hosts: list[list[str]] = []
+
+        class Stop(Exception):
+            pass
+
+        real_proxy = sandbox.Proxy
+        real_popen = subprocess.Popen
+
+        def recording_proxy(path: Path, hosts: list[str], log_hosts: bool) -> proxy.Proxy:
+            seen_hosts.append(list(hosts))
+            return real_proxy(path, hosts, log_hosts)
+
+        def popen(argv: list[str], **kwargs: object) -> object:
+            if "bwrap" not in argv:
+                return real_popen(argv, **kwargs)
+            raise Stop
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tree = worktree(Path(tmp))
+            for index, raw_hosts in enumerate(("", "chatgpt.com, api.openai.com")):
+                args = self.namespace(
+                    tree, Path(tmp, f"state-{index}"), agent="codex", hosts=raw_hosts, no_seccomp=True
+                )
+                with (
+                    mock.patch.object(sandbox.shutil, "which", return_value="/usr/bin/true"),
+                    mock.patch.object(sandbox, "Proxy", recording_proxy),
+                    mock.patch.object(sandbox.subprocess, "Popen", popen),
+                    self.assertRaises(Stop),
+                ):
+                    sandbox.code(args, ["true"])
+        self.assertEqual(seen_hosts, [[], ["chatgpt.com", "api.openai.com"]])
 
     def test_a_target_link_is_refused(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

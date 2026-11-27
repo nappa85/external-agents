@@ -42,7 +42,7 @@ repeatable, overrides it with one slot that tries those reviewers in order.
 | `codex`    | `codex exec --sandbox workspace-write`                                                          |
 | `claude`   | `claude -p` with only file tools, `dontAsk` permissions, and edits allowed only in the snapshot |
 | `opencode` | a generated `reviewer` agent with only file tools, and `external_directory` denied              |
-| `amp`      | a generated `external-reviewer` mode with only file tools, permissions limited to the snapshot  |
+| `amp`      | a generated `external-reviewer` mode with file tools that a plugin hook keeps in the snapshot   |
 | `vibe`     | `accept-edits` policy, `outside_workdir = "deny"`, shell, web, and subagent tools refused        |
 
 The snapshot prevents accidental exposure and edits. It is not a sandbox against a
@@ -52,15 +52,28 @@ reviewer that follows instructions injected into the reviewed code:
 - `codex --sandbox workspace-write` limits writes to the snapshot and blocks network,
   but its shell can still read files elsewhere on the host.
 
+### Sandboxed reviewers
+
+With `EXTERNAL_AGENTS_REVIEW_SANDBOX=1`, each reviewer runs inside the bubblewrap sandbox
+that `code` uses, on its snapshot, and gets a shell: it can search with `rg` and run the
+tests to confirm a finding. The sandbox sees the snapshot, the CLI and its login file, and
+reaches only the model provider. The wrapper's generated configuration stays read-only,
+and `codex` drops its own sandbox, which cannot start inside bubblewrap. Without a working
+bwrap (macOS, or a Linux host that refuses user namespaces) reviewers keep the file tools
+above. An `amp` reviewer also keeps them when there is no `AMP_API_KEY` or amp login file,
+since it could not sign in inside the sandbox. Files the repository ignores that a run
+creates, such as test caches, are left out of the returned patch.
+
 Project configuration in the snapshot that a backend would load and that can run code
 is not used: `claude` loads only user settings, and the wrapper removes `.codex/` for
 `codex`, `.opencode/` and `opencode.jsonc` for `opencode`, `.amp/plugins/` for `amp`,
 and `.vibe/` for `vibe`. The diff still shows changes to those files.
 
 The reviewer process receives only an allowlisted environment: basic variables such as
-`PATH`, `HOME`, locale, proxy, and CA settings, plus provider credential prefixes such as
-`OPENAI_`, `ANTHROPIC_`, and `MISTRAL_`. Only `amp` also receives `AMP_` variables. List
-any other variable a backend needs in `EXTERNAL_AGENTS_ENV_PASSTHROUGH`.
+`PATH`, `HOME`, locale, proxy, and CA settings, plus the credential prefixes of its own
+provider: `ANTHROPIC_` for `claude`, `OPENAI_` for `codex`, `AMP_` for `amp`, `MISTRAL_` for
+`vibe`, and the model's provider for `opencode`. List any other variable a backend needs in
+`EXTERNAL_AGENTS_ENV_PASSTHROUGH`.
 
 ## Amp without another CLI
 
@@ -170,7 +183,12 @@ and has an error line naming a provider failure, such as `Error: rate limit reac
 a review that merely discusses authorization or quotas is kept.
 
 `--idle-timeout` (default 300 s) kills a reviewer that prints nothing that long; it does
-not apply to `claude`, which prints only at the end. `vibe` prints an event for each
+not apply to `claude`, which prints only at the end. A model thinking hard can be silent
+for minutes, so the timeout doubles at `@high` and triples at `@xhigh` and `@max`, and the
+retry after a stall allows twice the silence again. An `amp` run that goes silent is
+checked on the server (`amp threads export`): while its turn is still in flight it gets up
+to two more idle periods, and a turn the server finished while the CLI printed nothing is
+taken as the review. `vibe` prints an event for each
 finished message and tool call. `amp` runs with `--stream-json`, so
 it prints an event per model turn and tool call, and a model request that hangs without
 failing trips the idle timeout instead of running into the total one. A paid reviewer

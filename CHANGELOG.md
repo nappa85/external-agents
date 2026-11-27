@@ -6,8 +6,61 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- The `amp` reviewer's confinement no longer relies on `amp.permissions` rules, which Amp
+  removes on 2026-12-04. The generated plugin's `tool.call` hook allows only its file tools,
+  on absolute paths whose real location, links resolved, is inside the snapshot. It also
+  refuses writes to `.amp/`, so the reviewer cannot rewrite the hook.
+- A `codex` reviewer could write the configuration of the repository that records its
+  changes, next to its snapshot in `/tmp`, and make the wrapper's own `git` run commands on
+  the host (`core.fsmonitor`, filter drivers). The repository now lives under the state
+  directory, its configuration is rewritten before every git command, and no hook runs.
+- A coding agent could repoint a submodule's `.git` file, or `git init` an uninitialised
+  submodule, so the host's next `git status` ran its commands. `code` refuses worktrees
+  with submodules, and masks nested `.git` files.
+- `--ro` over the state directory let the agent answer its own questions through the
+  control socket, and `--rw` over the main checkout let it write hooks; both are refused.
+- The diff filter let secrets through in plain `diff -u` patches, CRLF patches, and headers
+  whose path contains ` b/`; it now reads hunks by their line counts and drops any text
+  it cannot attribute to a file, such as a `diff -c` section. A
+  `--diff-file` inside the checkout, and earlier review output, no longer reach the
+  snapshot unfiltered. A tracked directory replaced by a link to `.git` is no longer copied.
+- Agents receive only their own provider's credentials, not every provider's; the
+  `amp` routing check no longer gets the full parent environment. Secret names match
+  regardless of case.
+- The agent could exhaust the connection slots it shared with the coordinator and lock
+  `question` and `answer` out; each socket has its own limit.
+- The seccomp filter also denies `pidfd_getfd` and `process_madvise`. The SNI parser checks
+  every length and reads a ClientHello split across records. The proxy escapes the
+  agent's text in its log.
+
 ### Fixed
 
+- A reviewer thinking for longer than `--idle-timeout` was killed as stalled. The timeout
+  grows with `@effort`, a retry allows twice the silence, and a silent `amp` run is checked
+  on the server: a turn still in flight earns more time, and one that finished is taken as
+  the review.
+- One slot's wrapper error discarded every other slot's finished review; it now ends only
+  that slot. A tracked `.amp` file or a directory where a generated file goes no longer
+  crashes a review.
+- Non-UTF-8 file names and contents crashed `review`; CRLF in hunks was turned into LF;
+  `--base` with a subdirectory `--source` gave paths that did not match the snapshot; a
+  rename to a non-ASCII name dropped that file from the diff.
+- A descendant that kept writing after the CLI exited turned a finished review into a
+  timeout. A stale `review-<n>.patch` survived a rerun. A preflight passed when the CLI only
+  echoed the prompt. Unexpected `amp` event shapes and `--output` in a missing directory
+  ended in a traceback. The free-tier ledger now applies to a model at every effort.
+- `--output-dir` at the checkout root no longer hides the checkout, a committed review
+  file stays out of `--base`, an untracked repository without commits no longer aborts
+  `--base`, and a refused `--include` exits 2 again.
+- `answer --to` takes the `run-...:N` token `question` prints, so a late answer cannot reach
+  a newer run. A malformed, infinite or NaN `--timeout` gets an error instead of a false "run ended"
+  or a spinning mailbox.
+- `--env` now overrides inherited credentials; `--hosts ""` allows no host and spaces in
+  `--hosts` are ignored; a signal-killed agent exits 128+N; `detect` and the bubblewrap
+  installer probe the flags `code` uses, and the installer no longer needs sudo when bwrap
+  is already installed.
 - `code` could fail at start with `OSError: [Errno 16] Device or resource busy`: it moved
   the seccomp filter to descriptor 9 with `dup2`, which fails when another thread is
   opening a file into that number at the same moment. bwrap now reads the filter from the
@@ -15,6 +68,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `EXTERNAL_AGENTS_REVIEW_SANDBOX=1` runs reviewers in the bubblewrap sandbox that `code`
+  uses, with a shell, so they can search and run the tests; `codex` is confined there too.
+  Without a working bwrap they keep file tools only.
+- The handoff diff shows whole changed functions, so reviewers open fewer files.
+- `amp` reviewers can search: the generated mode adds `search_files` (a regular expression
+  over file contents) and `find_files` (a glob over paths), confined to the snapshot like
+  its file tools. Amp has no search tool of its own, so reviewers read whole files to find
+  a definition.
 - `EXTERNAL_AGENTS_AMP_NO_CREDITS=1` runs an `amp` reviewer only when a provider
   connection linked to the Amp account, such as a ChatGPT subscription, serves its model.
   `amp config model-providers check-access` decides before each `amp` reviewer runs; a
@@ -109,6 +170,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   CLIs are installed when missing.
 - MIT license.
 
+[Unreleased]: https://github.com/nappa85/external-agents/compare/v0.1.4...HEAD
+[0.1.4]: https://github.com/nappa85/external-agents/compare/v0.1.3...v0.1.4
+[0.1.3]: https://github.com/nappa85/external-agents/compare/v0.1.2...v0.1.3
 [0.1.2]: https://github.com/nappa85/external-agents/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/nappa85/external-agents/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/nappa85/external-agents/releases/tag/v0.1.0

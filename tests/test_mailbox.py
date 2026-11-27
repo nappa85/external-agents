@@ -110,6 +110,47 @@ class Mailbox(unittest.TestCase):
         self.assertEqual(first.communicate(timeout=10)[0], "one\n")
         self.assertEqual(second.communicate(timeout=10)[0], "two\n")
 
+    def test_an_answer_for_the_previous_run_cannot_answer_the_current_run(self) -> None:
+        self.box.post("previous run")
+        shown = self.cli("question")
+        self.assertEqual((shown.returncode, shown.stdout), (0, "previous run\n"))
+        old_id = shown.stderr.split()[-1]
+        self.server.close()
+
+        run = self.state / "run-2"
+        (run / "ask").mkdir(parents=True)
+        latest = self.state / "latest"
+        latest.unlink()
+        latest.symlink_to(run.name)
+        box = mailbox.Mailbox(run / "questions.log")
+        server = mailbox.Server(box, run / "ask/sock", run / "control.sock")
+        self.addCleanup(server.close)
+        server.start()
+        box.post("current run")
+
+        reply = self.cli("answer", "--to", old_id, "for the previous run")
+
+        self.assertEqual(reply.returncode, 2, reply.stderr)
+        self.assertEqual(self.cli("question").stdout, "current run\n")
+
+    def test_the_agent_cannot_starve_the_coordinators_control_socket(self) -> None:
+        # The sandboxed agent may open as many connections to its socket as it likes; each
+        # holds a handler slot until its request deadline. The coordinator's socket must keep
+        # answering, and must not report that the run ended.
+        held = []
+        for _ in range(4 * mailbox.MAX_CLIENTS):
+            client = socket.socket(socket.AF_UNIX)
+            client.connect(str(self.ask_socket))
+            held.append(client)
+        self.addCleanup(lambda: [client.close() for client in held])
+        time.sleep(0.5)
+
+        shown = self.cli("question")
+
+        # Exit 1 alone would also match an uncaught exception.
+        self.assertNotIn("Traceback", shown.stderr)
+        self.assertEqual((shown.returncode, shown.stdout, shown.stderr), (1, "", ""))
+
     def test_an_asker_that_hangs_up_withdraws_its_question(self) -> None:
         asker = self.ask("never mind")
         self.wait_for_question()
@@ -155,6 +196,19 @@ class Mailbox(unittest.TestCase):
         out, err = asker.communicate(timeout=10)
         self.assertEqual(asker.returncode, 1)
         self.assertIn("the run is ending", err)
+
+    def test_a_question_request_with_a_non_numeric_timeout_gets_an_error(self) -> None:
+        with self.assertRaisesRegex(common.UsageError, "timeout must be a number"):
+            mailbox.request(self.state, {"op": "question", "wait": True, "timeout": "soon"})
+
+    def test_a_timeout_no_lock_can_wait_gets_an_error_not_a_false_run_end(self) -> None:
+        # `inf` overflowed `Condition.wait`, which looked like the run ending; `nan` spun forever.
+        for timeout in ("inf", "nan", "1e300", "-1"):
+            with self.subTest(timeout=timeout):
+                shown = self.cli("question", "--wait", "--timeout", timeout)
+
+                self.assertEqual(shown.returncode, 2, shown.stderr)
+                self.assertIn("timeout must be", shown.stderr)
 
     def test_a_malformed_control_request_gets_an_error(self) -> None:
         client = socket.socket(socket.AF_UNIX)

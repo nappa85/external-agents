@@ -7,10 +7,12 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
-from support import SCRIPT, common, review, snapshot
+from support import SCRIPT, common, review, sandbox, snapshot
 from xagents.backends import INSTALLERS
 
 
@@ -121,6 +123,22 @@ class SnapshotTests(Sandbox):
         self.assertIn("+fn new() {}", diff)
         self.assertEqual(names, "M\tsrc/lib.rs\nA\tsrc/new.rs\n")
 
+    def test_base_diff_preserves_crlf_in_tracked_and_untracked_hunks(self) -> None:
+        git(self.repo, "config", "core.autocrlf", "false")
+        self.write(".gitattributes", "*.txt -text\n")
+        tracked = self.repo / "tracked.txt"
+        tracked.write_bytes(b"before\r\n")
+        git(self.repo, "add", ".gitattributes", "tracked.txt")
+        git(self.repo, "commit", "-q", "-m", "CRLF fixture")
+        tracked.write_bytes(b"after\r\n")
+        (self.repo / "untracked.txt").write_bytes(b"new file\r\n")
+
+        diff, names = snapshot.filter_patch(snapshot.base_diff(self.repo, "HEAD"))
+
+        self.assertIn("-before\r\n+after\r\n", diff)
+        self.assertIn("+new file\r\n", diff)
+        self.assertEqual(names, "M\ttracked.txt\nA\tuntracked.txt\n")
+
     def test_base_diff_does_not_depend_on_the_users_diff_configuration(self) -> None:
         self.write("src/lib.rs", "fn changed() {}\n")
         self.write("src/new.rs", "fn new() {}\n")
@@ -135,6 +153,84 @@ class SnapshotTests(Sandbox):
 
                 self.assertIn("+fn changed() {}", diff)
                 self.assertEqual(names, "M\tsrc/lib.rs\nA\tsrc/new.rs\n")
+
+    def test_base_diff_of_a_subdirectory_uses_the_snapshots_paths(self) -> None:
+        # `--source` may name a subdirectory; the snapshot holds its files relative to it,
+        # so every diff header must too, tracked and untracked alike.
+        source = self.repo / "src"
+        self.write("src/lib.rs", "fn changed() {}\n")
+        self.write("src/new.rs", "fn new() {}\n")
+
+        diff = snapshot.base_diff(source, "HEAD")
+
+        headers = sorted(line for line in diff.splitlines() if line.startswith("diff --git"))
+        self.assertEqual(headers, ["diff --git a/lib.rs b/lib.rs", "diff --git a/new.rs b/new.rs"])
+        self.assertEqual(snapshot.source_files(source), [Path("lib.rs"), Path("new.rs")])
+
+    def test_changes_ignore_configuration_written_into_the_recording_repository(self) -> None:
+        # The recording repository sits next to the snapshot, where a codex reviewer can
+        # write (its workspace-write sandbox allows /tmp). Configuration planted there must
+        # not make the wrapper's own git run commands on the host.
+        snap = self.root / "snap"
+        snap.mkdir()
+        (snap / "a.txt").write_text("a\n")
+        git_dir = self.root / "changes.git"
+        changes = snapshot.Changes(git_dir, snap, ())
+        before = changes.tree()
+        marker = self.root / "ran"
+        with (git_dir / "config").open("a") as config:
+            config.write(f'[core]\n\tfsmonitor = "touch {marker}-fsmonitor; false"\n')
+            config.write(f'[filter "x"]\n\tclean = "touch {marker}-filter; cat"\n')
+        with (git_dir / "info" / "attributes").open("a") as attributes:
+            attributes.write("* filter=x\n")
+        (snap / "a.txt").write_text("b\n")
+
+        diff = changes.diff(before, changes.tree())
+
+        self.assertIn(b"+b", diff)
+        self.assertEqual(sorted(p.name for p in self.root.glob("ran-*")), [])
+
+    def test_changes_ignore_a_hook_planted_in_the_recording_repository(self) -> None:
+        snap = self.root / "snap"
+        snap.mkdir()
+        (snap / "a.txt").write_text("a\n")
+        git_dir = self.root / "changes.git"
+        changes = snapshot.Changes(git_dir, snap, ())
+        before = changes.tree()
+        marker = self.root / "ran-hook"
+        hook = git_dir / "hooks" / "post-index-change"
+        hook.parent.mkdir(exist_ok=True)
+        hook.write_text(f"#!/bin/sh\ntouch {marker}\n")
+        hook.chmod(0o755)
+        (snap / "a.txt").write_text("b\n")
+
+        diff = changes.diff(before, changes.tree())
+
+        self.assertIn(b"+b", diff)
+        self.assertFalse(marker.exists())
+
+    def test_non_utf8_content_and_names_survive_snapshot_and_diff(self) -> None:
+        # Latin-1 fixtures and file names are ordinary in real repositories.
+        (self.repo / "src/lib.rs").write_bytes(b"caf\xe9\n")
+        git(self.repo, "add", "-A")
+        git(self.repo, "commit", "-q", "-m", "latin-1")
+        (self.repo / "src/lib.rs").write_bytes(b"caf\xe9 au lait\n")
+        name = os.fsdecode(b"b\xe9.txt")
+        (self.repo / name).write_text("new\n")
+
+        diff = snapshot.base_diff(self.repo, "HEAD")
+        snapshot.snapshot(self.repo, self.root / "snap", [])
+
+        self.assertIn("diff --git a/src/lib.rs b/src/lib.rs", diff)
+        self.assertTrue((self.root / "snap" / name).is_file())
+
+    def test_base_diff_copes_with_an_untracked_repository_without_commits(self) -> None:
+        git(self.repo, "init", "-q", "scratch")
+        self.write("src/lib.rs", "fn changed() {}\n")
+
+        diff = snapshot.base_diff(self.repo, "HEAD")
+
+        self.assertIn("+fn changed() {}", diff)
 
     def test_diff_omits_tracked_and_untracked_secret_files(self) -> None:
         self.write("config/.env", "TOKEN=old\n")
@@ -176,6 +272,35 @@ class SnapshotTests(Sandbox):
 
         self.assertFalse((dest / "src").exists())
         self.assertTrue((dest / "AGENTS.md").is_file())
+
+    def test_a_directory_replaced_by_a_link_into_git_metadata_is_not_copied(self) -> None:
+        # Git still lists the directory's old paths, which now name files in `.git`.
+        self.write("cfg/config", "[app]\n")
+        git(self.repo, "add", "-A")
+        git(self.repo, "commit", "-q", "-m", "cfg")
+        git(self.repo, "config", "remote.origin.url", "https://user:TOKEN@example.com/repo.git")
+        shutil.rmtree(self.repo / "cfg")
+        (self.repo / "cfg").symlink_to(self.repo / ".git", target_is_directory=True)
+        dest = self.root / "snapshot"
+
+        snapshot.snapshot(self.repo, dest, [])
+
+        self.assertFalse((dest / "cfg/config").exists())
+        self.assertTrue((dest / "AGENTS.md").is_file())
+
+    def test_including_git_file_is_refused(self) -> None:
+        self.write("sub/.git", "gitdir: /elsewhere\n")
+
+        with self.assertRaisesRegex(common.UsageError, "secret-like"):
+            snapshot.snapshot(self.repo, self.root / "snapshot", [Path("sub/.git")])
+
+    def test_write_generated_replaces_an_existing_directory(self) -> None:
+        target = self.root / "REVIEW_PROMPT.md"
+        target.mkdir()
+
+        common.write_generated(target, "prompt\n")
+
+        self.assertEqual(target.read_text(), "prompt\n")
 
     def test_include_outside_the_source_is_refused(self) -> None:
         outside = self.root / "outside.md"
@@ -245,6 +370,27 @@ class ReviewerSelectionTests(Sandbox):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual((self.root / "out/review-1.md").read_text(), 'reviewer: amp:p/one\nmodel: "p/one"\n')
         self.assertEqual((self.root / "out/review-2.md").read_text(), 'reviewer: amp:p/two\nmodel: "p/two"\n')
+
+    def test_a_slot_that_crashes_does_not_discard_the_other_slots_reviews(self) -> None:
+        # A tracked file named `.amp` makes the amp slot fail while it writes its
+        # configuration; the claude slot's finished review must still be written, and the
+        # amp slot must report its own outcome.
+        self.write(".amp", "not a directory\n")
+        git(self.repo, "add", "-A")
+        git(self.repo, "commit", "-q", "-m", "dot amp file")
+        self.fake("claude", "echo claude review")
+        self.fake("amp", "echo amp review")
+
+        result = self.run_script(
+            "review", "--prompt-file", str(self.prompt), "--output-dir", str(self.root / "out"), "--no-preflight",
+            env={"EXTERNAL_REVIEWERS": "claude; amp:p/model"},
+        )  # fmt: skip
+
+        self.assertNotIn("Traceback", result.stderr)
+        self.assertEqual((self.root / "out/review-1.md").read_text(), "reviewer: claude\nclaude review\n")
+        self.assertTrue((self.root / "out/review-2.md").is_file(), result.stderr)
+        # 0 once the amp slot copes with the file, 3 while it still fails on its own.
+        self.assertIn(result.returncode, (0, 3), result.stderr)
 
     def fake_amp(self, report: str, exit_code: int = 0) -> Path:
         """An `amp` whose `check-access` prints `report`, exits `exit_code`, and records its arguments."""
@@ -341,13 +487,32 @@ class ReviewerSelectionTests(Sandbox):
         self.assertEqual((self.root / "out/review-1.md").read_text(), "reviewer: claude:sonnet\nclaude review\n")
         self.assertIn("slot 2: no reviewer available", result.stderr)
 
+    def test_the_handoff_diff_shows_whole_changed_functions(self) -> None:
+        body = [f"    let v{n} = {n};" for n in range(1, 11)]
+        self.write("src/long.rs", "\n".join(["fn first() {}", "", "fn long() {", *body, "}", "", "fn last() {}", ""]))
+        git(self.repo, "add", "-A")
+        git(self.repo, "commit", "-q", "-m", "long")
+        self.write("src/long.rs", (self.repo / "src/long.rs").read_text().replace("let v9 = 9;", "let v9 = 90;"))
+        self.fake("claude", "cat REVIEW_DIFF.patch")
+
+        result = self.review("--base", "HEAD")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        diff = self.output.read_text()
+        self.assertIn("\n fn long() {\n     let v1 = 1;\n", diff)
+        self.assertIn("+    let v9 = 90;\n", diff)
+        self.assertNotIn("\n fn first", diff)
+        self.assertNotIn("fn last", diff)
+
     def test_reviewer_changes_are_returned_as_a_patch_that_applies_to_the_checkout(self) -> None:
         self.write("src/old.rs", "fn old() {}\n")
         self.write("snapshot/nested.rs", "fn nested() {}\n")
         self.write("crlf.txt", "a\r\nb\r\n")
         self.write(".gitattributes", "crlf.txt -text\n")
+        self.write(".gitignore", ".agents/plans/\nbuild/\n")
         git(self.repo, "add", "-A")
         git(self.repo, "commit", "-q", "-m", "old")
+        self.write(".agents/plans/plan.md", "step 1\n")
         # The second reviewer must start from the reviewed tree, without the failed first one's change.
         self.fake("codex", "echo 'fn stale() {}' > src/stale.rs; exit 1")
         self.fake(
@@ -356,10 +521,12 @@ class ReviewerSelectionTests(Sandbox):
             "echo 'fn fixed() {}' > src/lib.rs; rm src/old.rs; echo 'fn moved() {}' > snapshot/nested.rs; "
             "printf 'a\\r\\nc\\r\\n' > crlf.txt; rm REVIEW_PROMPT.md; echo '{}' > opencode.json; "
             "echo 'run()' > .opencode/plugin.ts; echo TOKEN=x > .env; test -e src/stale.rs && echo stale; "
-            "echo 'crlf.txt text' > .gitattributes; git init -q fixture; echo data > fixture/data.txt; echo review",
+            "echo 'crlf.txt text' > .gitattributes; git init -q fixture; echo data > fixture/data.txt; "
+            # Build output the repository ignores is not a proposal; an included file is.
+            "mkdir build; echo obj > build/out.o; echo 'step 2' >> .agents/plans/plan.md; echo review",
         )
 
-        result = self.review(env={"EXTERNAL_REVIEWERS": "codex | opencode:p/m"})
+        result = self.review("--include", ".agents/plans/plan.md", env={"EXTERNAL_REVIEWERS": "codex | opencode:p/m"})
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.output.read_text(), "reviewer: opencode:p/m\nreview\n\nproposed changes: review.patch\n")
@@ -379,6 +546,19 @@ class ReviewerSelectionTests(Sandbox):
         self.assertEqual((self.repo / "tests/regression.rs").read_text(), "fn regression() {}\n")
         self.assertEqual((self.repo / "snapshot/nested.rs").read_text(), "fn moved() {}\n")
         self.assertEqual((self.repo / "crlf.txt").read_bytes(), b"a\r\nc\r\n")
+        self.assertEqual((self.repo / ".agents/plans/plan.md").read_text(), "step 1\nstep 2\n")
+        self.assertFalse((self.repo / "build").exists())
+
+    def test_preflight_is_not_passed_by_a_cli_that_only_echoes_its_prompt(self) -> None:
+        # Like `codex exec`, which prints the user turn: it exits 0 without answering.
+        self.fake("codex", 'for last; do :; done; echo user; echo "$last"; echo "ERROR: stream disconnected"')
+        pristine = self.root / "work" / "pristine"
+        pristine.mkdir(parents=True)
+
+        with mock.patch.dict(os.environ, {"PATH": f"{self.bin}:{self.tools}"}):
+            passed = review.preflight(review.Reviewer("codex", None), pristine, self.root / "log", 10, attempts=1)
+
+        self.assertFalse(passed)
 
     def test_unconfigured_panel_runs_no_external_reviewer(self) -> None:
         self.fake("claude", "echo claude review")
@@ -473,6 +653,108 @@ class ReviewerSelectionTests(Sandbox):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.output.read_text(), "reviewer: claude\nM\tsrc/lib.rs\n0\n")
 
+    def test_a_supplied_diff_inside_the_checkout_is_only_shared_after_filtering(self) -> None:
+        self.write("src/lib.rs", "fn changed() {}\n")
+        self.write(".env", "DUMMY_TOKEN=not-real\n")
+        git(self.repo, "add", "-f", ".env")
+        patch = self.repo / "change.patch"
+        raw = snapshot.base_diff(self.repo, "HEAD")
+        self.assertIn("DUMMY_TOKEN", raw)
+        patch.write_text(raw)
+        self.fake(
+            "claude",
+            'grep -q "fn changed" REVIEW_DIFF.patch && ! grep -q DUMMY_TOKEN REVIEW_DIFF.patch && '
+            'test ! -e change.patch && echo "only the filtered diff is visible"',
+        )
+
+        result = self.review("--diff-file", str(patch))
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("only the filtered diff is visible", self.output.read_text())
+
+    def test_review_artifacts_inside_the_checkout_are_not_shared_with_the_next_reviewer(self) -> None:
+        self.output = self.repo / "reviews" / "review-1.md"
+        self.fake("claude", 'echo "proposed edit" > src/lib.rs; echo first review')
+        first = self.run_script(
+            "review", "--prompt-file", str(self.prompt), "--no-preflight", "--reviewer", "claude",
+            "--output-dir", str(self.output.parent),
+        )  # fmt: skip
+        self.assertEqual(first.returncode, 0, first.stderr)
+        self.assertTrue(self.output.with_suffix(".patch").is_file())
+        self.fake(
+            "claude",
+            "test ! -e reviews/review-1.md && test ! -e reviews/review-1.log && "
+            "test ! -e reviews/review-1.patch && "
+            "! grep -qF reviews/review-1. REVIEW_DIFF.patch REVIEW_FILES.txt && echo independent review",
+        )
+
+        result = self.review("--base", "HEAD")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("independent review", self.output.read_text())
+
+    def test_reusing_an_output_does_not_leave_an_older_reviewers_patch(self) -> None:
+        for body, status in (("echo review without edits", 0), ("exit 1", 3)):
+            with self.subTest(status=status):
+                self.fake("claude", 'echo "proposed edit" > src/lib.rs; echo review with edits')
+                first = self.review()
+                self.assertEqual(first.returncode, 0, first.stderr)
+                patch = self.output.with_suffix(".patch")
+                self.assertTrue(patch.is_file())
+                self.fake("claude", body)
+
+                second = self.review()
+
+                self.assertEqual(second.returncode, status, second.stderr)
+                self.assertFalse(patch.exists())
+
+    def test_output_in_a_missing_directory_is_a_usage_error(self) -> None:
+        self.fake("claude", "echo review")
+
+        result = self.run_script(
+            "review", "--prompt-file", str(self.prompt), "--output", str(self.root / "missing/review.md"),
+            "--no-preflight", env={"EXTERNAL_REVIEWERS": "claude"},
+        )  # fmt: skip
+
+        self.assertNotIn("Traceback", result.stderr)
+        self.assertEqual(result.returncode, 2, result.stderr)
+
+    def test_an_output_dir_at_the_source_root_still_shows_the_sources(self) -> None:
+        self.fake("claude", "test -f src/lib.rs && test -f AGENTS.md && echo sources visible")
+
+        result = self.run_script(
+            "review", "--prompt-file", str(self.prompt), "--no-preflight", "--reviewer", "claude",
+            "--output-dir", ".",
+        )  # fmt: skip
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("sources visible", (self.repo / "review-1.md").read_text())
+
+    def test_a_refused_include_is_still_a_usage_error(self) -> None:
+        self.write(".env", "TOKEN=x\n")
+        self.fake("claude", "echo review")
+
+        result = self.review("--include", ".env")
+
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("secret-like", result.stderr)
+
+    def test_a_committed_review_artifact_stays_out_of_the_base_diff(self) -> None:
+        self.write("reviews/review-1.md", "old review\n")
+        git(self.repo, "add", "-A")
+        git(self.repo, "commit", "-q", "-m", "review")
+        self.write("reviews/review-1.md", "edited review\n")
+        self.write("src/lib.rs", "fn changed() {}\n")
+        self.fake("claude", "cat REVIEW_FILES.txt")
+
+        result = self.run_script(
+            "review", "--prompt-file", str(self.prompt), "--no-preflight", "--reviewer", "claude",
+            "--output-dir", str(self.repo / "reviews"), "--base", "HEAD",
+        )  # fmt: skip
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual((self.repo / "reviews/review-1.md").read_text(), "reviewer: claude\nM\tsrc/lib.rs\n")
+
     def test_missing_diff_file_is_a_usage_error(self) -> None:
         self.fake("claude", "echo review")
 
@@ -493,18 +775,21 @@ class ReviewerSelectionTests(Sandbox):
         self.assertIn("cannot use --output-dir", result.stderr)
 
     def test_reviewer_environment_drops_unrelated_credentials(self) -> None:
+        # A backend receives its own provider's credentials, never another provider's.
         self.fake(
             "claude",
-            'echo "github=${GITHUB_TOKEN:-unset} ssh=${SSH_AUTH_SOCK:-unset} openai=${OPENAI_API_KEY:-unset}'
+            'echo "anthropic=${ANTHROPIC_API_KEY:-unset} github=${GITHUB_TOKEN:-unset} ssh=${SSH_AUTH_SOCK:-unset} openai=${OPENAI_API_KEY:-unset}'
             ' amp=${AMP_API_KEY:-unset} lang=${LANG:-unset}"',
         )
         env = {"GITHUB_TOKEN": "gh", "SSH_AUTH_SOCK": "/agent", "OPENAI_API_KEY": "sk", "AMP_API_KEY": "amp"}
+        env["ANTHROPIC_API_KEY"] = "ak"
 
         result = self.review(env={**env, "LANG": "C.UTF-8"})
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(
-            self.output.read_text(), "reviewer: claude\ngithub=unset ssh=unset openai=sk amp=unset lang=C.UTF-8\n"
+            self.output.read_text(),
+            "reviewer: claude\nanthropic=ak github=unset ssh=unset openai=unset amp=unset lang=C.UTF-8\n",
         )
 
     def test_amp_reviewer_runs_only_the_generated_confined_mode(self) -> None:
@@ -516,7 +801,7 @@ class ReviewerSelectionTests(Sandbox):
             "amp",
             'echo "amp=${AMP_API_KEY:-unset} github=${GITHUB_TOKEN:-unset}"; ls .amp/plugins; '
             'grep -o "model: .*" .amp/plugins/external-reviewer.ts; '
-            'grep -c \'"action": "reject"\' .amp/settings.json; echo "$@"',
+            'echo "settings=$(cat .amp/settings.json)"; echo "$@"',
         )
 
         result = self.review("--reviewer", "amp:openai/gpt-6.1-sol", env={"AMP_API_KEY": "amp", "GITHUB_TOKEN": "gh"})
@@ -530,7 +815,7 @@ class ReviewerSelectionTests(Sandbox):
                 "amp=amp github=unset",
                 "external-reviewer.ts",
                 'model: "openai/gpt-6.1-sol",',
-                "4",
+                "settings={}",
             ],
         )
         self.assertRegex(lines[5], r"--settings-file \S+/snapshot/\.amp/settings\.json --mode external-reviewer ")
@@ -549,6 +834,48 @@ class ReviewerSelectionTests(Sandbox):
                 '\t\treasoningEffort: "high",',
             ],
         )
+
+    @unittest.skipIf(sandbox.unavailable(), "needs a working bubblewrap sandbox")
+    def test_a_sandboxed_reviewer_has_a_shell_but_nothing_outside_its_snapshot(self) -> None:
+        (self.tools / "bwrap").symlink_to(shutil.which("bwrap"))
+        for tool in ("tr", "cat"):
+            if not (self.tools / tool).exists():
+                (self.tools / tool).symlink_to(shutil.which(tool))
+        outside = self.root / "outside.txt"
+        outside.write_text("OUTSIDE\n")
+        self.fake(
+            "amp",
+            f"cat {outside} 2>/dev/null || echo outside=hidden\n"
+            "(echo planted > .amp/plugins/external-reviewer.ts) 2>/dev/null && echo plugin=writable || echo plugin=read-only\n"
+            'echo "fn added() {}" > src/added.rs && echo write=ok\n'
+            'echo "github=${GITHUB_TOKEN:-unset} amp=${AMP_API_KEY:-unset}"',
+        )
+        env = {"AMP_API_KEY": "amp", "GITHUB_TOKEN": "gh"}
+
+        unconfined = self.review("--reviewer", "amp:p/model", env=env)
+        unconfined_output = self.output.read_text()
+        confined = self.review("--reviewer", "amp:p/model", env=env | {"EXTERNAL_AGENTS_REVIEW_SANDBOX": "1"})
+
+        # The control: without the sandbox the same CLI reads the file and rewrites the plugin.
+        self.assertEqual(unconfined.returncode, 0, unconfined.stderr)
+        self.assertIn("OUTSIDE", unconfined_output)
+        self.assertIn("plugin=writable", unconfined_output)
+        self.assertEqual(confined.returncode, 0, confined.stderr)
+        lines = self.output.read_text().splitlines()
+        self.assertEqual(
+            lines[:5],
+            ["reviewer: amp:p/model", "outside=hidden", "plugin=read-only", "write=ok", "github=unset amp=amp"],
+        )
+        self.assertIn("+fn added() {}", self.output.with_suffix(".patch").read_text())
+        self.assertEqual(outside.read_text(), "OUTSIDE\n")
+
+        # Without a key or login file amp would wait for a device login in the sandbox.
+        (self.root / "home").mkdir()
+        no_login = {"GITHUB_TOKEN": "gh", "HOME": str(self.root / "home"), "EXTERNAL_AGENTS_REVIEW_SANDBOX": "1"}
+        result = self.review("--reviewer", "amp:p/model", env=no_login)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("amp:p/model: no AMP_API_KEY or amp login file", result.stderr)
+        self.assertIn("plugin=writable", self.output.read_text())
 
     def test_vibe_reviewer_runs_confined_without_the_repository_config(self) -> None:
         self.write(".vibe/tools/repo_tool.py", "import os\n")
@@ -598,6 +925,20 @@ class ReviewerSelectionTests(Sandbox):
         )
         self.assertEqual(review.vibe_output(1, "Error: Invalid API key"), "Error: Invalid API key")
 
+    def test_amp_output_survives_events_of_an_unexpected_shape(self) -> None:
+        raw = "\n".join(
+            [
+                json.dumps({"type": "assistant", "session_id": "T-1", "message": None}),
+                json.dumps({"type": "assistant", "message": {"content": ["plain string block"]}}),
+                "[killed: idle timeout]",
+            ]
+        )
+
+        output = review.amp_output(124, raw)
+
+        self.assertEqual(review.classify(124, output), "stalled")
+        self.assertIn("amp thread: T-1", output)
+
     def test_passthrough_keeps_a_named_credential(self) -> None:
         self.fake("claude", 'echo "mistral=${MISTRAL_API_KEY:-unset}"')
 
@@ -605,6 +946,132 @@ class ReviewerSelectionTests(Sandbox):
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.output.read_text(), "reviewer: claude\nmistral=m\n")
+
+
+@unittest.skipUnless(shutil.which("node"), "needs node")
+class AmpPluginTests(unittest.TestCase):
+    """The generated amp reviewer plugin under node, with a stand-in plugin API. Amp drops
+    `amp.permissions` rules, so the plugin's tool.call hook must decide every call."""
+
+    def setUp(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name)
+        self.snap = snap = self.root / "snapshot"
+        self.outside = outside = self.root / "outside"
+        (snap / "src").mkdir(parents=True)
+        outside.mkdir()
+        (snap / "src/lib.rs").write_text("fn old() {}\nfn Older() {}\n")
+        (snap / "src/a.py").write_text("def old(): pass\n")
+        (snap / "blob.bin").write_bytes(b"old\0")
+        (outside / "secret.txt").write_text("TOKEN_OUTSIDE\n")
+        (self.root / "snapshot-sibling").mkdir()
+        (snap / "link.txt").symlink_to(outside / "secret.txt")
+        (snap / "linked-dir").symlink_to(outside)
+        (snap / "dangling.txt").symlink_to(outside / "planted.txt")
+        review.Reviewer("amp", "p/model").prepare(snap)
+        self.plugin = self.root / "plugin.mjs"
+        shutil.copyfile(snap / ".amp/plugins/external-reviewer.ts", self.plugin)
+
+    def run_plugin(self, operations: list[tuple[str, str, dict[str, object]]]) -> list[str]:
+        """Each operation is (`hook` or `run`, tool, input); returns the hook's action, or
+        the tool's text or `error: message`."""
+        driver = (
+            "const handlers = {}, tools = {};\n"
+            "const amp = { createAgent: () => ({ definition: {} }), registerAgentMode() {},"
+            " registerTool(tool) { tools[tool.name] = tool }, on(name, handler) { handlers[name] = handler } };\n"
+            f"(await import({json.dumps(self.plugin.as_uri())})).default(amp);\n"
+            "const results = [];\n"
+            "for (const [kind, tool, input] of JSON.parse(process.argv[1])) {\n"
+            "  if (kind === 'hook') {\n"
+            "    const result = await handlers['tool.call']({ toolUseID: 't', tool, input, thread: { id: 'T' } });\n"
+            "    results.push(result.action);\n"
+            "  } else {\n"
+            "    try { results.push(await tools[tool].execute(input, {})) }\n"
+            "    catch (error) { results.push(`error: ${error.message}`) }\n"
+            "  }\n"
+            "}\n"
+            "console.log(JSON.stringify(results));\n"
+        )
+        result = subprocess.run(
+            ["node", "--input-type=module", "-e", driver, json.dumps(operations)], capture_output=True, text=True
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return json.loads(result.stdout)
+
+    def test_the_hook_allows_only_its_tools_inside_the_snapshot(self) -> None:
+        snap, outside = self.snap, self.outside
+        calls = [
+            ("Read", f"{snap}/src/lib.rs", "allow"),
+            ("Read", str(snap), "allow"),
+            ("Read", f"{snap}/.amp/settings.json", "allow"),
+            ("create_file", f"{snap}/tests/new/test_bug.rs", "allow"),
+            ("edit_file", f"{snap}/src/lib.rs", "allow"),
+            ("search_files", None, "allow"),
+            ("find_files", f"{snap}/src", "allow"),
+            ("Read", f"{outside}/secret.txt", "reject"),
+            ("Read", f"{snap}-sibling", "reject"),
+            ("Read", "src/lib.rs", "reject"),
+            ("Read", f"{snap}/src/../../outside/secret.txt", "reject"),
+            ("Read", f"{snap}/missing/../link.txt", "reject"),
+            ("Read", f"{snap}/link.txt", "reject"),
+            ("Read", f"{snap}/linked-dir/secret.txt", "reject"),
+            ("create_file", f"{snap}/linked-dir/new.txt", "reject"),
+            ("create_file", f"{snap}/dangling.txt", "reject"),
+            ("edit_file", f"{snap}/.amp/plugins/external-reviewer.ts", "reject"),
+            ("create_file", f"{snap}/.amp/settings.json", "reject"),
+            ("search_files", f"{snap}/linked-dir", "reject"),
+            ("find_files", str(outside), "reject"),
+            ("shell_command", f"{snap}/src/lib.rs", "reject"),
+            ("Read", None, "reject"),
+        ]
+        actions = self.run_plugin([("hook", tool, {} if path is None else {"path": path}) for tool, path, _ in calls])
+        actions = [{"reject-and-continue": "reject"}.get(action, action) for action in actions]
+        self.assertEqual([(tool, path, action) for (tool, path, _), action in zip(calls, actions, strict=True)], calls)
+
+    def test_in_the_sandbox_the_hook_also_allows_the_shell(self) -> None:
+        review.Reviewer("amp", "p/model", sandboxed=True).prepare(self.snap)
+        shutil.copyfile(self.snap / ".amp/plugins/external-reviewer.ts", self.plugin)
+        operations = [
+            ("hook", "shell_command", {"command": "pytest"}),
+            ("hook", "shell_command_status", {"pid": 1}),
+            ("hook", "Read", {"path": f"{self.outside}/secret.txt"}),
+            ("hook", "web_search", {"query": "x"}),
+        ]
+        self.assertEqual(self.run_plugin(operations), ["allow", "allow", "reject-and-continue", "reject-and-continue"])
+
+    def test_the_search_tools_stay_in_the_snapshot(self) -> None:
+        (self.snap / "many.txt").write_text("hit\n" * 250)
+        results = self.run_plugin(
+            [
+                ("run", "search_files", {"pattern": "fn old|def old"}),
+                ("run", "search_files", {"pattern": "OLD", "ignore_case": True, "glob": "**/*.rs"}),
+                ("run", "search_files", {"pattern": "TOKEN_OUTSIDE"}),
+                ("run", "search_files", {"pattern": "(", "path": f"{self.snap}/src"}),
+                ("run", "search_files", {"pattern": "TOKEN", "path": f"{self.outside}"}),
+                ("run", "find_files", {"glob": "src/*"}),
+                ("run", "find_files", {"glob": "*.txt"}),
+                ("run", "search_files", {"pattern": "hit", "path": f"{self.snap}/many.txt"}),
+            ]
+        )
+
+        invalid = results.pop(3)
+        self.assertTrue(invalid.startswith("error: Invalid pattern: "), invalid)
+        self.assertEqual(
+            results[:6],
+            [
+                "src/a.py:1: def old(): pass\nsrc/lib.rs:1: fn old() {}",
+                "src/lib.rs:1: fn old() {}\nsrc/lib.rs:2: fn Older() {}",
+                "No matches.",
+                f"error: Stay inside {self.snap.resolve()}.",
+                "src/a.py\nsrc/lib.rs",
+                "many.txt",
+            ],
+        )
+        lines = results[6].splitlines()
+        self.assertEqual(len(lines), 201)
+        self.assertEqual(lines[199], "many.txt:200: hit")
+        self.assertEqual(lines[200], "More results; narrow the search.")
 
 
 class FreeTierAndCompletenessTests(Sandbox):
@@ -663,6 +1130,80 @@ class FreeTierAndCompletenessTests(Sandbox):
         self.assertEqual(review.classify(124, "partial\n[killed: idle timeout]"), "stalled")
         self.assertEqual(review.classify(124, "partial\n[killed: total timeout]"), "timed out")
 
+    def test_a_silent_amp_run_still_working_on_the_server_is_not_stalled(self) -> None:
+        # A model thinking at length prints nothing; the Amp server shows its turn in flight,
+        # and then its answer, which is taken even though the CLI never printed it.
+        exports = self.root / "exports"
+        working = {"messages": [{"role": "user", "content": [{"type": "text", "text": "review"}]}]}
+        answered = {
+            "messages": [
+                {"role": "user", "content": [{"type": "text", "text": "review"}]},
+                {
+                    "role": "assistant",
+                    "state": {"type": "complete", "stopReason": "end_turn"},
+                    "content": [{"type": "thinking", "thinking": "..."}, {"type": "text", "text": "VERDICT: ready"}],
+                },
+            ]
+        }
+        working_file, answered_file = self.root / "working.json", self.root / "answered.json"
+        working_file.write_text(json.dumps(working))
+        answered_file.write_text(json.dumps(answered))
+        init = json.dumps({"type": "system", "subtype": "init", "session_id": "T-1"})
+        self.fake(
+            "amp",
+            f'if [ "$1" = threads ]; then echo x >> {exports}; n=$(grep -c . {exports})\n'
+            f'  if [ "$n" -lt 2 ]; then cat {working_file}; else cat {answered_file}; fi\n'
+            f"  exit 0\nfi\necho '{init}'\nsleep 30",
+        )
+
+        result = self.panel("amp:p/model", "--expect", "(?i)verdict")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.output.read_text(), "reviewer: amp:p/model\nVERDICT: ready")
+        self.assertNotIn("stalled", result.stderr)
+        log = self.output.with_suffix(".log").read_text()
+        self.assertIn("T-1 is still working on the server", log)
+
+    def test_the_amp_server_check_does_not_outlast_the_total_timeout(self) -> None:
+        init = json.dumps({"type": "system", "subtype": "init", "session_id": "T-1"})
+        self.fake("amp", f"[ \"$1\" = threads ] && {{ sleep 30; exit 1; }}\necho '{init}'\nsleep 30")
+        started = time.monotonic()
+
+        result = self.panel("amp:p/model", "--timeout", "3")
+
+        self.assertLess(time.monotonic() - started, 15)
+        self.assertEqual(result.returncode, 3, result.stderr)
+        self.assertIn("amp:p/model: timed out", result.stderr)
+        self.assertNotIn("retrying once", result.stderr)
+
+    def test_unexpected_amp_export_shapes_count_as_unknown(self) -> None:
+        exports = [
+            {"messages": [{"role": "assistant", "state": "complete", "content": []}]},
+            {"messages": [{"role": "assistant", "state": {"type": "complete", "stopReason": "end_turn"}, "content": 1}]},
+            {"messages": [{"role": "assistant", "state": {"type": "complete", "stopReason": "end_turn"},
+                           "content": [{"type": "text", "text": None}]}]},
+            {"messages": "none"},
+            [],
+        ]  # fmt: skip
+        for export in exports:
+            with self.subTest(export=export):
+                self.fake("amp", f"echo '{json.dumps(export)}'")
+                with mock.patch.dict(os.environ, {"PATH": f"{self.bin}:{self.tools}"}):
+                    state, text = review.amp_thread_state("T-1", self.root, dict(os.environ))
+                self.assertIn(state, ("unknown", "stopped"))
+                self.assertIsNone(text)
+
+    def test_a_high_effort_reviewer_may_stay_silent_longer(self) -> None:
+        # No server to ask: the idle timeout itself grows with the effort.
+        self.fake("opencode", "sleep 1.5; echo review")
+
+        medium = self.panel("opencode:p/model@medium")
+        high = self.panel("opencode:p/model@high")
+
+        self.assertIn("opencode:p/model@medium: stalled", medium.stderr)
+        self.assertEqual(high.returncode, 0, high.stderr)
+        self.assertEqual(self.output.read_text(), "reviewer: opencode:p/model@high\nreview\n")
+
     def test_a_stalled_amp_reviewer_is_retried_once_and_its_trace_kept(self) -> None:
         # `amp --stream-json` events; the run stalls after its first tool call while the
         # counter file holds a positive number.
@@ -680,6 +1221,8 @@ class FreeTierAndCompletenessTests(Sandbox):
         counter = self.root / "stalls"
         self.fake(
             "amp",
+            # `amp threads export` fails, so the server cannot vouch for the silent run.
+            f'[ "$1" = threads ] && exit 1\n'
             f"echo 'Warning: deprecated' >&2\ncat {self.root / 'start'}\nn=$(cat {counter})\n"
             f'if [ "$n" -gt 0 ]; then echo $((n - 1)) > {counter}; sleep 30; fi\ncat {self.root / "end"}',
         )
@@ -722,6 +1265,70 @@ class PatchFilterTests(unittest.TestCase):
 
         self.assertEqual(snapshot.filter_patch(patch), ("", ""))
 
+    def test_mixed_quoted_and_unquoted_headers_are_kept_and_filtered(self) -> None:
+        patch = (
+            'diff --git a/dev/null "b/d\\303\\251/ok.rs"\nnew file mode 100644\n+fn ok() {}\n'
+            'diff --git a/dev/null "b/d\\303\\251/.env"\nnew file mode 100644\n+TOKEN=secret\n'
+            'diff --git a/src/old.rs "b/src/d\\303\\251.rs"\nrename from src/old.rs\nrename to "src/d\\303\\251.rs"\n'
+        )
+
+        diff, names = snapshot.filter_patch(patch)
+
+        self.assertNotIn("TOKEN", diff)
+        self.assertIn("+fn ok() {}", diff)
+        self.assertEqual(names, "A\td\u00e9/ok.rs\nR\tsrc/d\u00e9.rs\n")
+
+    def test_crlf_patch_still_filters_added_secret_files(self) -> None:
+        patch = (
+            "diff --git a/dev/null b/.env\r\nnew file mode 100644\r\n+TOKEN=secret\r\n"
+            "diff --git a/src/lib.rs b/src/lib.rs\r\n+fn ok() {}\r\n"
+        )
+
+        diff, names = snapshot.filter_patch(patch)
+
+        self.assertNotIn("TOKEN", diff)
+        self.assertEqual(names, "M\tsrc/lib.rs\n")
+
+    def test_rename_from_secret_to_name_with_b_slash_is_filtered(self) -> None:
+        patch = "diff --git a/.env b/safe b/x.txt\nrename from .env\nrename to safe b/x.txt\n-TOKEN=secret\n"
+
+        diff, names = snapshot.filter_patch(patch)
+
+        self.assertNotIn("TOKEN", diff)
+        self.assertEqual(names, "")
+
+    def test_hunk_lines_that_look_like_file_headers_do_not_end_a_secret_file(self) -> None:
+        # A removed `-- x` and an added `++ y` line, then the next hunk, read like a new file.
+        patch = (
+            "diff --git a/.env b/.env\n--- a/.env\n+++ b/.env\n@@ -1 +1 @@\n"
+            "--- old\n+++ new\n@@ -9 +9 @@\n-TOKEN=old-secret\n+TOKEN=new-secret\n"
+        )
+
+        self.assertEqual(snapshot.filter_patch(patch), ("", ""))
+
+    def test_an_invalid_escape_in_a_quoted_header_drops_its_file(self) -> None:
+        patch = 'diff --git "a/\\xz" "b/\\xz"\n+TOKEN=secret\ndiff --git a/ok.rs b/ok.rs\n+fn ok() {}\n'
+
+        self.assertEqual(snapshot.filter_patch(patch), ("diff --git a/ok.rs b/ok.rs\n+fn ok() {}\n", "M\tok.rs\n"))
+
+    def test_a_diff_format_the_filter_cannot_read_is_dropped(self) -> None:
+        context = "*** a/.env\t2026\n--- b/.env\t2026\n***************\n*** 1 ****\n! TOKEN=a\n--- 1 ----\n! TOKEN=b\n"
+        git_then_context = "diff --git a/a.rs b/a.rs\n--- a/a.rs\n+++ b/a.rs\n@@ -1 +1 @@\n-x\n+y\n" + context
+
+        self.assertEqual(snapshot.filter_patch(context), ("", ""))
+        diff, names = snapshot.filter_patch(git_then_context)
+        self.assertNotIn("TOKEN", diff)
+        self.assertEqual(names, "M\ta.rs\n")
+
+    def test_a_secret_in_a_plain_unified_diff_is_filtered(self) -> None:
+        # `--diff-file` accepts any diff, such as one from `diff -ruN` or another VCS,
+        # whose file headers are not `diff --git` lines.
+        patch = "--- a/.env\n+++ b/.env\n@@ -0,0 +1 @@\n+TOKEN=secret\n"
+
+        diff, _ = snapshot.filter_patch(patch)
+
+        self.assertNotIn("TOKEN", diff)
+
 
 class TimeoutTests(unittest.TestCase):
     def test_output_without_a_newline_does_not_defeat_the_timeout(self) -> None:
@@ -748,6 +1355,17 @@ class TimeoutTests(unittest.TestCase):
             code, output = common.run_with_timeouts(command, Path(tmp), total=10, idle=None, env=dict(os.environ))
 
         self.assertEqual((code, output), (0, "review\n"))
+
+    def test_a_chatty_descendant_does_not_turn_a_finished_run_into_a_timeout(self) -> None:
+        # A CLI may leave a child that keeps writing to the inherited stdout after the CLI
+        # itself exited with its review.
+        with tempfile.TemporaryDirectory() as tmp:
+            command = ["sh", "-c", "echo review; (while :; do echo tick; sleep 0.2; done) & exit 0"]
+
+            code, output = common.run_with_timeouts(command, Path(tmp), total=5, idle=None, env=dict(os.environ))
+
+        self.assertEqual(code, 0, output[-200:])
+        self.assertTrue(output.startswith("review\n"), output[:200])
 
 
 if __name__ == "__main__":

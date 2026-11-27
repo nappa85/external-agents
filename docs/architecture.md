@@ -34,10 +34,16 @@ skills/external-agents/scripts/
    file-tools-only configuration: `claude -p` with `Read,Glob,Grep,Edit,Write`,
    `dontAsk`, and edits allowed only under the snapshot; a generated opencode agent with
    a deny-by-default permission list and `external_directory: deny`; a generated Amp
-   plugin mode with three file tools and path-matching permission rules; `vibe` with
+   plugin mode (`amp_reviewer.js`) with three file tools, its own search tools, and a
+   `tool.call` hook that rejects any call outside the snapshot, links resolved, and any
+   write to `.amp/`; `vibe` with
    the `accept-edits` policy, `outside_workdir = "deny"`, shell, web and subagent tools
    set to `never`, and those settings passed as `VIBE_*` variables, which override the
-   user's config; `codex exec --sandbox workspace-write`.
+   user's config; `codex exec --sandbox workspace-write`. With
+   `EXTERNAL_AGENTS_REVIEW_SANDBOX=1` and a working bwrap, the CLI instead runs inside the
+   `code` sandbox (`sandbox.launch`, without the mailbox) on the snapshot, with its shell
+   allowed and the generated configuration bound read-only. The handoff diff carries
+   whole changed functions (`--function-context`).
 4. **Run.** The CLI runs in its own session with an allowlisted environment. A total
    deadline and an idle deadline (for CLIs that stream output) kill the whole process
    group. Output is read in raw chunks, so a run that prints without a newline or closes
@@ -51,8 +57,9 @@ skills/external-agents/scripts/
    machine under a file lock, and one that stalls or fails is recorded in a daily
    ledger and skipped until the next UTC day.
 7. **Changes.** Before and after each attempt, the snapshot is recorded in a private
-   Git repository next to it (no user or system configuration; attributes that would
-   convert content are unset). The diff, minus handoff files, generated configuration,
+   Git repository under the state directory, out of every reviewer's reach (no user or
+   system configuration, no hooks; its config and attributes are rewritten before every
+   git command, and attributes that would convert content are unset). The diff, minus handoff files, generated configuration,
    and secret-like files, becomes `review-<n>.patch`.
 
 ## Coding sandbox
@@ -135,7 +142,7 @@ askers with an error and waiting `question --wait` calls with exit 4.
 **Defended against:** an agent, or instructions injected into the code it reads, trying
 to read secrets outside the worktree, read untracked secret files inside it, reach hosts
 other than its model API, reach host or LAN services, tamper with the host's git
-metadata, plant files the host later opens while handling questions, or persist beyond
+metadata (a worktree with submodules is refused, since their `.git` paths are writable), plant files the host later opens while handling questions, or persist beyond
 the run.
 
 **Not defended against:**

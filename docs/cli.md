@@ -17,12 +17,15 @@ python3 -I skills/external-agents/scripts/external_agents.py <command> [options]
 | `EXTERNAL_AGENTS_ENV_PASSTHROUGH` | `review`, `code`  | extra variable names, comma-separated, passed to agents                       |
 | `EXTERNAL_AGENTS_PIN`             | install scripts   | `1` replaces an installed CLI of another version with the pinned one          |
 | `EXTERNAL_AGENTS_AMP_NO_CREDITS`  | `review`          | `1` runs an `amp` reviewer only on a provider connection linked to the account; its routing check may cost a few Amp credits and, outside an Amp thread, needs `AMP_THREAD_ID` |
+| `EXTERNAL_AGENTS_REVIEW_SANDBOX`  | `review`          | `1` runs reviewers in the bubblewrap sandbox with a shell; without a working bwrap, or for an `amp` without `AMP_API_KEY` or a login file, they keep file tools only |
 | `XDG_STATE_HOME`                  | `review`          | where the free-tier ledger lives (default `~/.local/state`)                   |
 
 Agents otherwise receive only basic variables (`PATH`, `HOME`, locale, proxy, CA
-settings) and provider credentials (`OPENAI_*`, `ANTHROPIC_*`, `CLAUDE_*`, `CODEX_*`,
-`OPENCODE_*`, `OPENROUTER_*`, `AWS_*`, `GOOGLE_*`, `GEMINI_*`, `VERTEX_*`, `AZURE_*`,
-`MISTRAL_*`, and `AMP_*` for amp only).
+settings) and the backend's own provider credentials: `ANTHROPIC_*` and `CLAUDE_*` for claude, plus
+the `AWS_*`, `GOOGLE_*`, `VERTEX_*`, `CLOUD_ML_*` and `AZURE_*` platforms that serve Claude;
+`OPENAI_*`, `CODEX_*` and `AZURE_*` for codex; `AMP_*` for amp; `MISTRAL_*` for vibe; and for
+opencode `OPENCODE_*` plus the prefixes of the model's provider, such as `OPENAI_*` for
+`openai/...`. No agent receives another provider's keys.
 
 ## Backends and models
 
@@ -94,13 +97,13 @@ Runs the panel on a snapshot of a Git checkout.
 | `--output-dir DIR`        | one `review-<n>.md` per slot (or `--output FILE` for a one-slot panel)          |
 | `--source DIR`            | checkout to snapshot (default: current directory)                               |
 | `--base REV`              | diff from `REV` to the working tree, untracked files included, as `REVIEW_DIFF.patch` |
-| `--diff-file FILE`        | use a precomputed Git-format diff instead                                       |
+| `--diff-file FILE`        | use a precomputed Git or unified diff instead; text it cannot attribute to a file is dropped |
 | `--include PATH`          | add an ignored file, such as a plan; repeatable                                 |
 | `--reviewers PANEL`       | override `EXTERNAL_REVIEWERS` for this run                                      |
 | `--reviewer AGENT`        | override with one slot; repeat for fallbacks                                    |
 | `--expect REGEX`          | a review must match, or it counts as incomplete and the next reviewer runs      |
 | `--timeout S`             | per-attempt limit (default 1800)                                                |
-| `--idle-timeout S`        | kill after S seconds of silence (default 300; not for `claude`)                 |
+| `--idle-timeout S`        | kill after S seconds of silence (default 300, ×2 at `@high`, ×3 above; not `claude`) |
 | `--no-preflight`          | skip the "Reply with exactly: PONG" check before each reviewer                  |
 
 The snapshot also holds `REVIEW_FILES.txt`, the changed paths with a status letter
@@ -123,7 +126,7 @@ of the agent, to check it: `-- <backend> --version` checks that the agent starts
 | `--raw-task`       | send the task without the preamble                                          |
 | `--agent AGENT`    | override `EXTERNAL_CODER`                                                   |
 | `--allow-host H`   | add an egress host (port 443); repeatable                                   |
-| `--hosts H,H`      | replace the backend's default egress hosts                                  |
+| `--hosts H,H`      | replace the default hosts and `--allow-host`; `--hosts ""` allows none      |
 | `--log-hosts`      | log every `CONNECT` the agent makes                                         |
 | `--preset rust`    | expose the Rust toolchain and Cargo caches; offline builds                  |
 | `--ro PATH`        | bind a path read-only at the same place; repeatable                         |
@@ -133,19 +136,21 @@ of the agent, to check it: `-- <backend> --version` checks that the agent starts
 | `--timeout S`      | stop the agent after S seconds (default 7200)                               |
 | `--no-seccomp`     | allow running without the seccomp filter on non-x86_64 hosts                |
 
-Exit: the agent's own status; 124 on timeout; 2 usage error.
+Exit: the agent's own status; 128+N when a signal N killed it; 124 on timeout; 2 usage error.
 
 ## `question --state DIR [--wait] [--timeout S]`
 
 Prints the coding agent's oldest unanswered question on stdout and
-`xagents: question <id>` on stderr.
+`xagents: question <id>, answer with --to <run>:<id>` on stderr.
 
 Exit: 0 a question was printed; 1 none waiting (or `--timeout` passed); 4 no active run,
 or the run ended during `--wait`.
 
 ## `answer --state DIR [--to ID] TEXT`
 
-Answers the oldest question. With `--to`, only if it is still question `ID`.
+Answers the oldest question. With `--to`, only if it is still question `ID`; `ID` is the
+`run-...:N` token that `question` prints, so an answer meant for an earlier run is refused
+once a newer run starts. A bare `N` is accepted and checks only the number.
 
 Exit: 0 delivered; 2 nothing waiting, or `ID` is no longer the oldest; 4 no active run.
 

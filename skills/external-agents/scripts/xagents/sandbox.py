@@ -27,14 +27,18 @@ text is untrusted data.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import datetime as dt
+import functools
 import json
 import os
 import platform
+import shlex
 import shutil
 import signal
 import subprocess
 import sys
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -48,7 +52,7 @@ from .backends import (
     coder_hosts,
     parse_agent,
 )
-from .common import ENV_CODER, UsageError, credential_env, is_secret
+from .common import ENV_CODER, VCS_DIRS, UsageError, credential_env, is_secret
 from .proxy import Proxy
 
 HOME = Path.home()
@@ -123,6 +127,8 @@ class Mounts:
     path: list[str] = field(default_factory=list)
     env: dict[str, str] = field(default_factory=dict)
     rw: list[tuple[str, str]] = field(default_factory=list)
+    # Paths inside the worktree that stay read-only, such as an agent's generated config.
+    protected: list[str] = field(default_factory=list)
 
     def add_ro(self, path: str) -> None:
         if not is_system(path) and path not in self.ro:
@@ -267,14 +273,15 @@ def tracked_files(worktree: Path) -> set[str]:
 
 
 def masks(worktree: Path) -> tuple[list[Path], list[Path]]:
-    """Untracked secret-like files to cover with an empty file, and VCS directories to
-    cover with an empty tmpfs. Every file is walked, build output included; links are
-    neither followed nor masked, since their targets outside the tree are not visible."""
+    """Untracked secret-like files and nested VCS files, such as a submodule's `.git` file,
+    to cover with an empty read-only file, and VCS directories to cover with an empty
+    tmpfs. Every file is walked, build output included; links are neither followed nor
+    masked, since their targets outside the tree are not visible."""
     tracked = tracked_files(worktree)
     files, directories = [], []
     for root, subdirectories, names in os.walk(worktree):
         for name in list(subdirectories):
-            if name in (".git", ".jj"):
+            if name in VCS_DIRS:
                 directories.append(Path(root, name))
                 subdirectories.remove(name)
         for name in names:
@@ -282,13 +289,41 @@ def masks(worktree: Path) -> tuple[list[Path], list[Path]]:
             relative = path.relative_to(worktree)
             if path.is_symlink() or relative == Path(".git"):
                 continue
-            if is_secret(Path(name)) and relative.as_posix() not in tracked:
+            if name in VCS_DIRS or (is_secret(Path(name)) and relative.as_posix() not in tracked):
                 files.append(path)
     return sorted(files), sorted(directories)
 
 
+def submodule_paths(worktree: Path) -> list[str]:
+    """Paths of the worktree's submodules (gitlinks in its index)."""
+    result = subprocess.run(["git", "-C", str(worktree), "ls-files", "-s", "-z"], capture_output=True)
+    if result.returncode != 0:
+        return []
+    entries = (os.fsdecode(entry) for entry in result.stdout.split(b"\0") if entry)
+    return [entry.partition("\t")[2] for entry in entries if entry.startswith("160000 ")]
+
+
+def git_common_dir(worktree: Path) -> Path | None:
+    """The main repository's git directory, which holds the worktree's hooks and config."""
+    result = subprocess.run(
+        ["git", "-C", str(worktree), "rev-parse", "--path-format=absolute", "--git-common-dir"], capture_output=True
+    )
+    # Bytes: the path may not be UTF-8. Only the terminating newline is Git's.
+    path = os.fsdecode(result.stdout.removesuffix(b"\n"))
+    return Path(path).resolve() if result.returncode == 0 and path else None
+
+
+def overlaps(a: Path, b: Path) -> bool:
+    return a.is_relative_to(b) or b.is_relative_to(a)
+
+
 def bwrap_args(
-    worktree: Path, run: Path, mounts: Mounts, hidden: tuple[list[Path], list[Path]], seccomp_fd: int | None = None
+    worktree: Path,
+    run: Path,
+    mounts: Mounts,
+    hidden: tuple[list[Path], list[Path]],
+    seccomp_fd: int | None = None,
+    ask: bool = True,
 ) -> list[str]:
     home = str(HOME)
     args = ["bwrap", "--die-with-parent", "--new-session", "--unshare-all", "--unshare-user", "--disable-userns"]
@@ -311,11 +346,12 @@ def bwrap_args(
         args += ["--ro-bind", path, path]
     for source, dest in mounts.rw:
         args += ["--bind", source, dest]
-    for name in ("ask", "ask.py", "forward.py"):
+    for name in ("ask", "ask.py", "forward.py") if ask else ("forward.py",):
         args += ["--ro-bind", str(run / "tools" / name), f"{TOOL_DIR}/{name}"]
     # Connecting to a socket needs no write access to its mount, so the agent can use
     # these sockets but cannot replace them.
-    args += ["--ro-bind", str(run / "ask"), "/ask"]
+    if ask:
+        args += ["--ro-bind", str(run / "ask"), "/ask"]
     args += ["--ro-bind", str(run / "proxy"), "/proxy"]
     args += ["--bind", str(worktree), str(worktree)]
     # After the worktree bind, so they cover what it exposes.
@@ -324,6 +360,8 @@ def bwrap_args(
         args += ["--ro-bind", str(run / "empty"), str(path)]
     for path in vcs_directories:
         args += ["--tmpfs", str(path)]
+    for path in mounts.protected:
+        args += ["--ro-bind", path, path]
     if (worktree / ".git").is_file():
         args += ["--ro-bind", str(worktree / ".git"), str(worktree / ".git")]
     proxy = f"http://127.0.0.1:{PROXY_PORT}"
@@ -347,24 +385,46 @@ def bwrap_args(
     return args
 
 
-def prepare(state: Path, backend: str | None, python: str) -> Path:
+def prepare(state: Path, home_files: dict[str, str], python: str) -> Path:
     """A fresh run directory under `state`; launcher-owned files are written before the
     sandbox exists, so the agent never had a chance to plant links in it."""
     run = state / f"run-{dt.datetime.now():%Y%m%d-%H%M%S}-{os.getpid()}"
     run.mkdir()
     for sub in ("home", "ask", "proxy", "tools"):
         (run / sub).mkdir()
-    for relative, content in (coder_files(backend) if backend else {}).items():
+    for relative, content in home_files.items():
         (run / "home" / relative).parent.mkdir(parents=True, exist_ok=True)
         (run / "home" / relative).write_text(content)
     (run / "empty").touch(mode=0o444)
-    (run / "tools/ask").write_text(f'#!/bin/sh\nexec {python} -I {TOOL_DIR}/ask.py "$@"\n')
+    (run / "tools/ask").write_text(f'#!/bin/sh\nexec {shlex.quote(python)} -I {TOOL_DIR}/ask.py "$@"\n')
     (run / "tools/ask").chmod(0o755)
     (run / "tools/ask.py").write_text(mailbox.ASK)
     (run / "tools/forward.py").write_text(FORWARDER)
-    (state / "latest").unlink(missing_ok=True)
-    (state / "latest").symlink_to(run.name)
+    # Replaced atomically, so a coordinator never finds the link missing between runs.
+    link = state / f".latest-{os.getpid()}"
+    link.unlink(missing_ok=True)
+    link.symlink_to(run.name)
+    os.replace(link, state / "latest")
     return run
+
+
+@functools.cache
+def unavailable() -> str | None:
+    """Why the sandbox cannot run on this machine, or None when it can."""
+    if shutil.which("bwrap") is None:
+        return "bubblewrap is not installed"
+    if platform.machine() != "x86_64":
+        return f"the seccomp filter does not support {platform.machine()}"
+    # The probe runs this interpreter, which needs nothing from PATH.
+    probe = ["bwrap", "--unshare-all", "--unshare-user", "--disable-userns", "--ro-bind", "/", "/"]
+    probe += [sys.executable, "-I", "-c", ""]
+    try:
+        result = subprocess.run(probe, capture_output=True, text=True, errors="replace", timeout=30)
+    except (OSError, subprocess.TimeoutExpired) as error:
+        return f"bwrap does not start: {error}"
+    if result.returncode != 0:
+        return f"bwrap cannot create its namespaces: {' '.join(result.stderr.split())[-200:]}"
+    return None
 
 
 def cpu_list(requested: int | None) -> list[int] | None:
@@ -389,6 +449,61 @@ os.execvp(sys.argv[2], sys.argv[2:])
 """
 
 
+def bind_agent(backend: str, model: str | None, mounts: Mounts) -> str:
+    """Bind an agent CLI, its login files and its credential variables; return the CLI's
+    real path."""
+    executable = bind_executable(backend, mounts)
+    mounts.credentials = [rel for rel in CODER_CREDENTIALS[backend] if (HOME / rel).is_file()]
+    mounts.env |= credential_env(backend, model) | coder_env(backend)
+    return executable
+
+
+@contextlib.contextmanager
+def launch(
+    worktree: Path,
+    state: Path,
+    mounts: Mounts,
+    hosts: list[str],
+    python: str,
+    home_files: dict[str, str],
+    cpus: list[int] | None = None,
+    log_hosts: bool = False,
+    ask: bool = True,
+) -> Iterator[tuple[list[str], tuple[int, ...], Path]]:
+    """Serve the egress proxy, and the mailbox when `ask` is set, for one run.
+
+    Yields the launcher, which runs the command appended to it in the sandbox; the
+    descriptors the launcher's process must inherit; and the run directory."""
+    run = prepare(state, home_files, python)
+    for relative in mounts.credentials:
+        (run / "home" / relative).parent.mkdir(parents=True, exist_ok=True)
+        (run / "home" / relative).touch()
+    if platform.machine() == "x86_64":
+        (run / "seccomp.bpf").write_bytes(seccomp.encode(seccomp.program()))
+    # bwrap reads the filter from whatever descriptor it lands on (`--seccomp N`). Moving it to
+    # a fixed number with dup2 failed with EBUSY whenever another thread was opening a file
+    # into that number at the same moment.
+    bpf = os.open(run / "seccomp.bpf", os.O_RDONLY) if (run / "seccomp.bpf").exists() else None
+    proxy = Proxy(run / "proxy" / "sock", hosts, log_hosts)
+    questions = None
+    try:
+        proxy.start()
+        if ask:
+            questions = mailbox.Server(
+                mailbox.Mailbox(run / "questions.log"), run / "ask" / "sock", run / "control.sock"
+            )
+            questions.start()
+        argv = bwrap_args(worktree, run, mounts, masks(worktree), bpf, ask)
+        launcher = [sys.executable, "-I", "-c", CONFINE, ",".join(map(str, cpus or [])), *argv]
+        yield [*launcher, python, "-I", f"{TOOL_DIR}/forward.py"], (bpf,) if bpf is not None else (), run
+    finally:
+        if bpf is not None:
+            os.close(bpf)
+        proxy.server.close()
+        if questions is not None:
+            questions.close()
+
+
 def code(args: argparse.Namespace, command: list[str] | None) -> int:
     if shutil.which("bwrap") is None:
         fail("bubblewrap is not installed; run `external_agents.py install bubblewrap`")
@@ -400,6 +515,11 @@ def code(args: argparse.Namespace, command: list[str] | None) -> int:
         fail("run it on a git worktree (`git worktree add`), not a main checkout: the agent could plant hooks in .git")
     if not worktree.is_dir():
         fail(f"{worktree} is not a directory")
+    if submodules := submodule_paths(worktree):
+        # An uninitialised submodule is an empty directory the agent could `git init`, and
+        # an initialised one has a `.git` file it could repoint: either way the host's next
+        # `git status` would load configuration the agent wrote, such as core.fsmonitor.
+        fail(f"worktrees with submodules are not supported ({submodules[0]}); the agent could plant git config in them")
     if HOME.resolve().is_relative_to(worktree):
         fail(f"{worktree} contains the home directory")
     if command is None and (args.task is None or not args.task.is_file()):
@@ -409,72 +529,65 @@ def code(args: argparse.Namespace, command: list[str] | None) -> int:
         fail("the state dir must be outside the worktree, and not contain it")
     state.mkdir(parents=True, exist_ok=True)
     cpus = cpu_list(args.cpus)
+    if platform.machine() != "x86_64" and not args.no_seccomp:
+        fail(f"the seccomp filter supports x86_64 only; pass --no-seccomp to run on {platform.machine()} without it")
+    common_dir = git_common_dir(worktree)
 
     mounts = Mounts()
     python = python_for_forwarder(mounts)
     for name in args.preset:
         PRESETS[name](mounts, state, len(cpus) if cpus else None)
-    for path in args.ro:
-        mounts.add_ro(check_bind(path))
-    for path in args.rw:
-        real = check_bind(path)
-        if Path(real).is_relative_to(state) or state.is_relative_to(real):
-            fail(f"--rw {path} overlaps the state dir")
-        mounts.rw.append((real, real))
+    for option, paths in (("--ro", args.ro), ("--rw", args.rw)):
+        for path in paths:
+            real = check_bind(path)
+            # Even read-only, the state dir exposes the control socket, and connecting to a
+            # socket needs no write access: the agent could answer its own questions.
+            if overlaps(Path(real), state):
+                fail(f"{option} {path} overlaps the state dir")
+            if option == "--rw" and common_dir is not None and overlaps(Path(real), common_dir):
+                fail(f"--rw {path} overlaps the main repository's git dir {common_dir}, whose hooks run on the host")
+            if option == "--ro":
+                mounts.add_ro(real)
+            else:
+                mounts.rw.append((real, real))
+    requested_env = {}
     for pair in args.env:
         key, sep, value = pair.partition("=")
         if not sep or not key:
             fail(f"--env {pair!r} is not KEY=VALUE")
-        mounts.env[key] = value
+        requested_env[key] = value
 
     backend, model = parse_agent(spec, CODER_MODEL_REQUIRED) if spec else (None, None)
     defaults = coder_hosts(backend, model) if backend else ()
-    hosts = args.hosts.split(",") if args.hosts else [*defaults, *args.allow_host]
+    if args.hosts is not None:
+        hosts = [host.strip() for host in args.hosts.split(",") if host.strip()]
+    else:
+        hosts = [*defaults, *(host.strip() for host in args.allow_host if host.strip())]
     # A check command still gets the configured agent, so `-- <agent> --version` shows
     # whether it starts in the sandbox.
     if backend is not None:
-        executable = bind_executable(backend, mounts)
+        executable = bind_agent(backend, model, mounts)
         if command and command[0] == backend:
             # The bound file may have another name, such as an npm package's `codex.js`.
             command = [executable, *command[1:]]
-        mounts.credentials = [rel for rel in CODER_CREDENTIALS[backend] if (HOME / rel).is_file()]
-        mounts.env |= credential_env(backend) | coder_env(backend)
+    # What the caller asked for explicitly wins over inherited and default variables.
+    mounts.env |= requested_env
     if command is None:
         assert backend is not None
-        if not hosts:
+        if not hosts and args.hosts is None:
             fail(f"no egress host is known for {spec}; name the provider's API host with --allow-host")
-        if not mounts.credentials and not credential_env(backend):
+        if not mounts.credentials and not credential_env(backend, model):
             print(f"warning: {backend} has no login file or credential variable; it may fail", file=sys.stderr)
         task = args.task.read_text()
         if not args.raw_task:
             task = PREAMBLE.format(worktree=worktree) + task
         command = coder_command(backend, executable, model, worktree, task)
 
-    run = prepare(state, backend, python)
-    for relative in mounts.credentials:
-        (run / "home" / relative).parent.mkdir(parents=True, exist_ok=True)
-        (run / "home" / relative).touch()
-    if platform.machine() == "x86_64":
-        (run / "seccomp.bpf").write_bytes(seccomp.encode(seccomp.program()))
-    elif not args.no_seccomp:
-        fail(f"the seccomp filter supports x86_64 only; pass --no-seccomp to run on {platform.machine()} without it")
-    # bwrap reads the filter from whatever descriptor it lands on (`--seccomp N`). Moving it to
-    # a fixed number with dup2 failed with EBUSY whenever another thread was opening a file
-    # into that number at the same moment.
-    bpf = os.open(run / "seccomp.bpf", os.O_RDONLY) if (run / "seccomp.bpf").exists() else None
-    proxy = Proxy(run / "proxy" / "sock", hosts, args.log_hosts)
-    proxy.start()
-    questions = mailbox.Server(mailbox.Mailbox(run / "questions.log"), run / "ask" / "sock", run / "control.sock")
-    questions.start()
-    argv = bwrap_args(worktree, run, mounts, masks(worktree), bpf)
-    argv += [python, "-I", f"{TOOL_DIR}/forward.py", *command]
-    print(f"xagents: run {run.name}, egress {', '.join(hosts) or 'none'}", file=sys.stderr)
-
-    try:
-        child = subprocess.Popen(
-            [sys.executable, "-I", "-c", CONFINE, ",".join(map(str, cpus or [])), *argv],
-            pass_fds=(bpf,) if bpf is not None else (),
-        )
+    with launch(
+        worktree, state, mounts, hosts, python, coder_files(backend) if backend else {}, cpus, args.log_hosts
+    ) as (launcher, fds, run):
+        print(f"xagents: run {run.name}, egress {', '.join(hosts) or 'none'}", file=sys.stderr)
+        child = subprocess.Popen([*launcher, *command], pass_fds=fds)
         try:
             code = child.wait(timeout=args.timeout)
         except subprocess.TimeoutExpired:
@@ -486,11 +599,9 @@ def code(args: argparse.Namespace, command: list[str] | None) -> int:
                 child.wait()
             print(f"xagents: stopped after {args.timeout} s", file=sys.stderr)
             code = 124
-    finally:
-        if bpf is not None:
-            os.close(bpf)
-        proxy.server.close()
-        questions.close()
+        if code < 0:
+            # Killed by a signal: report it the way a shell does.
+            code = 128 - code
     print(
         f"xagents: agent exited {code}. The worktree is untrusted until reviewed: read the whole "
         "diff before building, testing or running anything from it.",
@@ -514,7 +625,9 @@ def add_parsers(commands: argparse._SubParsersAction) -> None:
     run.add_argument("--cpus", type=int, help="Pin to this many CPUs")
     run.add_argument("--timeout", type=float, default=7200)
     run.add_argument("--allow-host", action="append", default=[], help="Add an egress host (port 443)")
-    run.add_argument("--hosts", help="Comma-separated egress hosts, replacing the backend's defaults")
+    run.add_argument(
+        "--hosts", help="Comma-separated egress hosts, replacing the defaults and --allow-host; empty for none"
+    )
     run.add_argument("--log-hosts", action="store_true", help="Log every CONNECT target to stderr")
     run.add_argument("--preset", action="append", default=[], choices=sorted(PRESETS), help="Toolchain to expose")
     run.add_argument("--ro", action="append", default=[], help="Bind a path read-only at the same place")
@@ -537,5 +650,7 @@ def add_parsers(commands: argparse._SubParsersAction) -> None:
         description="Exit 0 when delivered; 4 when no run is active.",
     )
     reply.add_argument("--state", type=Path, required=True)
-    reply.add_argument("--to", type=int, help="The id `question` printed; refuse if that question is gone")
+    reply.add_argument(
+        "--to", help="The id `question` printed, such as run-...:3; refuse if that question or its run is gone"
+    )
     reply.add_argument("text")

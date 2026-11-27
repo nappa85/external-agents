@@ -8,17 +8,16 @@ if [ "$(uname -s)" != Linux ]; then
   exit 1
 fi
 
-sudo=()
-if [ "$(id -u)" != 0 ]; then
-  if command -v sudo >/dev/null 2>&1; then
-    sudo=(sudo)
-  else
-    echo "bubblewrap install: needs root or sudo" >&2
-    exit 1
-  fi
-fi
-
 if ! command -v bwrap >/dev/null 2>&1; then
+  sudo=()
+  if [ "$(id -u)" != 0 ]; then
+    if command -v sudo >/dev/null 2>&1; then
+      sudo=(sudo)
+    else
+      echo "bubblewrap install: needs root or sudo" >&2
+      exit 1
+    fi
+  fi
   echo "Installing bubblewrap..."
   if command -v apt-get >/dev/null 2>&1; then
     "${sudo[@]}" apt-get update
@@ -39,7 +38,8 @@ if ! command -v bwrap >/dev/null 2>&1; then
   fi
 fi
 
-if bwrap --unshare-all --ro-bind / / true 2>/dev/null; then
+# The same namespaces the coding sandbox uses; --disable-userns needs bubblewrap 0.8.
+if bwrap --unshare-all --unshare-user --disable-userns --clearenv --ro-bind / / true 2>/dev/null; then
   echo "bubblewrap $(bwrap --version | awk '{print $2}') works"
   exit 0
 fi
@@ -53,5 +53,6 @@ bubblewrap is installed but cannot create its namespaces here. Common causes:
   bwrap-userns-restrict AppArmor profile that the apparmor package ships for /usr/bin/bwrap
   (`sudo apparmor_parser -r /etc/apparmor.d/bwrap-userns-restrict`).
 - kernel.unprivileged_userns_clone=0 (older Debian) or user.max_user_namespaces=0.
+- bubblewrap older than 0.8 lacks --disable-userns; install a newer release.
 MSG
 exit 1
