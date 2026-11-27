@@ -107,7 +107,11 @@ def read(path: Path) -> dict | None:
         status = json.loads(path.read_text())
     except (OSError, ValueError):
         return None
-    return status if isinstance(status, dict) else None
+    # Anything else is not a status this script wrote.
+    if not isinstance(status, dict):
+        return None
+    slots = status.get("slots", [])
+    return status if isinstance(slots, list) and all(isinstance(slot, dict) for slot in slots) else None
 
 
 class Tracker:
@@ -206,9 +210,9 @@ def background(script: Path, argv: list[str], output: Path | None, output_dir: P
     except OSError as error:
         raise UsageError(f"cannot use --output-dir {output_dir}: {error}") from error
     log = run_log_path(output, output_dir)
+    # The run replaces an earlier run's status under its lock; one with another pid is
+    # never taken for this run's.
     path = status_path(output, output_dir)
-    # An earlier run's status would read as this run's outcome.
-    path.unlink(missing_ok=True)
     with log.open("w") as out:
         child = subprocess.Popen(
             [sys.executable, "-I", str(script), *argv],
@@ -218,16 +222,21 @@ def background(script: Path, argv: list[str], output: Path | None, output_dir: P
             env={**os.environ, ENV_DETACHED: "1"},
             start_new_session=True,
         )
-    while child.poll() is None:
+    while True:
+        # Read the exit before the status: a run that wrote its status and then ended
+        # between two polls started, and its outcome is for `review-status`.
+        ended = child.poll() is not None
         status = read(path)
         if status is not None and status.get("pid") == child.pid:
             where = f"--output {output}" if output is not None else f"--output-dir {output_dir}"
-            print(f"review running in the background (pid {child.pid}); its own output goes to {log}")
+            print(f"review started in the background (pid {child.pid}); its own output goes to {log}")
             print(f"wait for it with: {script.name} review-status --wait {where}")
             return 0
+        if ended:
+            # It ended without recording a run, such as on a usage error.
+            sys.stderr.write(log.read_text())
+            return child.returncode
         time.sleep(0.1)
-    sys.stderr.write(log.read_text())
-    return child.returncode
 
 
 def add_parser(commands: argparse._SubParsersAction) -> None:

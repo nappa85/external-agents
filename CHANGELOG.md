@@ -41,6 +41,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `review --background` returned the run's own exit code, such as 3, as a failure to
+  start when the run ended before its first check. A run that recorded its status now
+  counts as started, and its outcome comes from `review-status`. A malformed status file
+  makes `review-status` exit 4 instead of crashing with exit 1, which means running.
 - A reviewer thinking for longer than `--idle-timeout` was killed as stalled. The timeout
   grows with `@effort`, a retry allows twice the silence, and a silent `amp` run is checked
   on the server: a turn still in flight earns more time, and one that finished is taken as
