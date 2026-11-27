@@ -27,6 +27,7 @@ text is untrusted data.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import datetime as dt
 import json
 import os
@@ -36,6 +37,7 @@ import shutil
 import signal
 import subprocess
 import sys
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -313,7 +315,12 @@ def overlaps(a: Path, b: Path) -> bool:
 
 
 def bwrap_args(
-    worktree: Path, run: Path, mounts: Mounts, hidden: tuple[list[Path], list[Path]], seccomp_fd: int | None = None
+    worktree: Path,
+    run: Path,
+    mounts: Mounts,
+    hidden: tuple[list[Path], list[Path]],
+    seccomp_fd: int | None = None,
+    ask: bool = True,
 ) -> list[str]:
     home = str(HOME)
     args = ["bwrap", "--die-with-parent", "--new-session", "--unshare-all", "--unshare-user", "--disable-userns"]
@@ -336,11 +343,12 @@ def bwrap_args(
         args += ["--ro-bind", path, path]
     for source, dest in mounts.rw:
         args += ["--bind", source, dest]
-    for name in ("ask", "ask.py", "forward.py"):
+    for name in ("ask", "ask.py", "forward.py") if ask else ("forward.py",):
         args += ["--ro-bind", str(run / "tools" / name), f"{TOOL_DIR}/{name}"]
     # Connecting to a socket needs no write access to its mount, so the agent can use
     # these sockets but cannot replace them.
-    args += ["--ro-bind", str(run / "ask"), "/ask"]
+    if ask:
+        args += ["--ro-bind", str(run / "ask"), "/ask"]
     args += ["--ro-bind", str(run / "proxy"), "/proxy"]
     args += ["--bind", str(worktree), str(worktree)]
     # After the worktree bind, so they cover what it exposes.
@@ -372,14 +380,14 @@ def bwrap_args(
     return args
 
 
-def prepare(state: Path, backend: str | None, python: str) -> Path:
+def prepare(state: Path, home_files: dict[str, str], python: str) -> Path:
     """A fresh run directory under `state`; launcher-owned files are written before the
     sandbox exists, so the agent never had a chance to plant links in it."""
     run = state / f"run-{dt.datetime.now():%Y%m%d-%H%M%S}-{os.getpid()}"
     run.mkdir()
     for sub in ("home", "ask", "proxy", "tools"):
         (run / sub).mkdir()
-    for relative, content in (coder_files(backend) if backend else {}).items():
+    for relative, content in home_files.items():
         (run / "home" / relative).parent.mkdir(parents=True, exist_ok=True)
         (run / "home" / relative).write_text(content)
     (run / "empty").touch(mode=0o444)
@@ -415,6 +423,61 @@ if cpus:
 os.nice(10)
 os.execvp(sys.argv[2], sys.argv[2:])
 """
+
+
+def bind_agent(backend: str, model: str | None, mounts: Mounts) -> str:
+    """Bind an agent CLI, its login files and its credential variables; return the CLI's
+    real path."""
+    executable = bind_executable(backend, mounts)
+    mounts.credentials = [rel for rel in CODER_CREDENTIALS[backend] if (HOME / rel).is_file()]
+    mounts.env |= credential_env(backend, model) | coder_env(backend)
+    return executable
+
+
+@contextlib.contextmanager
+def launch(
+    worktree: Path,
+    state: Path,
+    mounts: Mounts,
+    hosts: list[str],
+    python: str,
+    home_files: dict[str, str],
+    cpus: list[int] | None = None,
+    log_hosts: bool = False,
+    ask: bool = True,
+) -> Iterator[tuple[list[str], tuple[int, ...], Path]]:
+    """Serve the egress proxy, and the mailbox when `ask` is set, for one run.
+
+    Yields the launcher, which runs the command appended to it in the sandbox; the
+    descriptors the launcher's process must inherit; and the run directory."""
+    run = prepare(state, home_files, python)
+    for relative in mounts.credentials:
+        (run / "home" / relative).parent.mkdir(parents=True, exist_ok=True)
+        (run / "home" / relative).touch()
+    if platform.machine() == "x86_64":
+        (run / "seccomp.bpf").write_bytes(seccomp.encode(seccomp.program()))
+    # bwrap reads the filter from whatever descriptor it lands on (`--seccomp N`). Moving it to
+    # a fixed number with dup2 failed with EBUSY whenever another thread was opening a file
+    # into that number at the same moment.
+    bpf = os.open(run / "seccomp.bpf", os.O_RDONLY) if (run / "seccomp.bpf").exists() else None
+    proxy = Proxy(run / "proxy" / "sock", hosts, log_hosts)
+    questions = None
+    try:
+        proxy.start()
+        if ask:
+            questions = mailbox.Server(
+                mailbox.Mailbox(run / "questions.log"), run / "ask" / "sock", run / "control.sock"
+            )
+            questions.start()
+        argv = bwrap_args(worktree, run, mounts, masks(worktree), bpf, ask)
+        launcher = [sys.executable, "-I", "-c", CONFINE, ",".join(map(str, cpus or [])), *argv]
+        yield [*launcher, python, "-I", f"{TOOL_DIR}/forward.py"], (bpf,) if bpf is not None else (), run
+    finally:
+        if bpf is not None:
+            os.close(bpf)
+        proxy.server.close()
+        if questions is not None:
+            questions.close()
 
 
 def code(args: argparse.Namespace, command: list[str] | None) -> int:
@@ -479,12 +542,10 @@ def code(args: argparse.Namespace, command: list[str] | None) -> int:
     # A check command still gets the configured agent, so `-- <agent> --version` shows
     # whether it starts in the sandbox.
     if backend is not None:
-        executable = bind_executable(backend, mounts)
+        executable = bind_agent(backend, model, mounts)
         if command and command[0] == backend:
             # The bound file may have another name, such as an npm package's `codex.js`.
             command = [executable, *command[1:]]
-        mounts.credentials = [rel for rel in CODER_CREDENTIALS[backend] if (HOME / rel).is_file()]
-        mounts.env |= credential_env(backend, model) | coder_env(backend)
     # What the caller asked for explicitly wins over inherited and default variables.
     mounts.env |= requested_env
     if command is None:
@@ -498,29 +559,11 @@ def code(args: argparse.Namespace, command: list[str] | None) -> int:
             task = PREAMBLE.format(worktree=worktree) + task
         command = coder_command(backend, executable, model, worktree, task)
 
-    run = prepare(state, backend, python)
-    for relative in mounts.credentials:
-        (run / "home" / relative).parent.mkdir(parents=True, exist_ok=True)
-        (run / "home" / relative).touch()
-    if platform.machine() == "x86_64":
-        (run / "seccomp.bpf").write_bytes(seccomp.encode(seccomp.program()))
-    # bwrap reads the filter from whatever descriptor it lands on (`--seccomp N`). Moving it to
-    # a fixed number with dup2 failed with EBUSY whenever another thread was opening a file
-    # into that number at the same moment.
-    bpf = os.open(run / "seccomp.bpf", os.O_RDONLY) if (run / "seccomp.bpf").exists() else None
-    proxy = Proxy(run / "proxy" / "sock", hosts, args.log_hosts)
-    proxy.start()
-    questions = mailbox.Server(mailbox.Mailbox(run / "questions.log"), run / "ask" / "sock", run / "control.sock")
-    questions.start()
-    argv = bwrap_args(worktree, run, mounts, masks(worktree), bpf)
-    argv += [python, "-I", f"{TOOL_DIR}/forward.py", *command]
-    print(f"xagents: run {run.name}, egress {', '.join(hosts) or 'none'}", file=sys.stderr)
-
-    try:
-        child = subprocess.Popen(
-            [sys.executable, "-I", "-c", CONFINE, ",".join(map(str, cpus or [])), *argv],
-            pass_fds=(bpf,) if bpf is not None else (),
-        )
+    with launch(
+        worktree, state, mounts, hosts, python, coder_files(backend) if backend else {}, cpus, args.log_hosts
+    ) as (launcher, fds, run):
+        print(f"xagents: run {run.name}, egress {', '.join(hosts) or 'none'}", file=sys.stderr)
+        child = subprocess.Popen([*launcher, *command], pass_fds=fds)
         try:
             code = child.wait(timeout=args.timeout)
         except subprocess.TimeoutExpired:
@@ -535,11 +578,6 @@ def code(args: argparse.Namespace, command: list[str] | None) -> int:
         if code < 0:
             # Killed by a signal: report it the way a shell does.
             code = 128 - code
-    finally:
-        if bpf is not None:
-            os.close(bpf)
-        proxy.server.close()
-        questions.close()
     print(
         f"xagents: agent exited {code}. The worktree is untrusted until reviewed: read the whole "
         "diff before building, testing or running anything from it.",
