@@ -1074,7 +1074,7 @@ class ReviewStatusTests(Sandbox):
 
         self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
         self.assertIn("slot 1: written by amp:p/fast", done.stdout)
-        self.assertNotIn("review running in the background", (self.out / "review-run.log").read_text())
+        self.assertNotIn("review started in the background", (self.out / "review-run.log").read_text())
 
     def test_a_bad_base_is_a_usage_error_and_records_no_run(self) -> None:
         result = self.run_script(
@@ -1116,6 +1116,30 @@ class ReviewStatusTests(Sandbox):
         done = self.status("--wait", "--timeout", "30")
 
         self.assertEqual(done.returncode, 0, done.stdout + (self.out / "review-1.md").read_text())
+
+    def test_a_run_that_ends_before_background_sees_its_status_still_counts_as_started(self) -> None:
+        # The child records its run and exits 3 before the first poll after the start.
+        script = self.root / "fast_run.py"
+        script.write_text(
+            "import json, os, sys\n"
+            "out = sys.argv[-1]\n"
+            "open(os.path.join(out, 'review-status.json'), 'w').write(json.dumps({'pid': os.getpid()}))\n"
+            "sys.exit(3)\n"
+        )
+        real_sleep = time.sleep
+        with mock.patch.object(review.status.time, "sleep", lambda _: real_sleep(1)), mock.patch("sys.stdout"):
+            code = review.status.background(script, [str(self.out)], None, self.out)
+
+        self.assertEqual(code, 0)
+
+    def test_a_malformed_status_counts_as_no_run(self) -> None:
+        self.out.mkdir()
+        (self.out / "review-status.json").write_text(json.dumps({"state": "running", "slots": 5}))
+
+        result = self.status()
+
+        self.assertEqual(result.returncode, 4, result.stdout + result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
 
     def test_a_foreground_run_with_output_records_its_status_next_to_it(self) -> None:
         self.release.touch()
