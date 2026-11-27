@@ -125,7 +125,7 @@ def main(argv: list[str]) -> int:
         if args.command == "install":
             return install(args)
         # The detached run gets the same arguments, so it must not detach again.
-        if args.command == "review" and args.background and not os.environ.get(status.ENV_DETACHED):
+        if args.command == "review" and args.background and args.detached_run is None:
             return status.background(Path(__file__).resolve(), argv, args.output, args.output_dir)
         if args.command == "review":
             return review.review(args)

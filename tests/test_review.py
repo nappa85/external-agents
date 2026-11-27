@@ -1122,8 +1122,7 @@ class ReviewStatusTests(Sandbox):
         script = self.root / "fast_run.py"
         script.write_text(
             "import json, os, sys\n"
-            "out = sys.argv[-1]\n"
-            "run = os.environ['XAGENTS_DETACHED_REVIEW']\n"
+            "out, run = sys.argv[1], sys.argv[-1]\n"
             "open(os.path.join(out, 'review-status.json'), 'w').write(json.dumps({'pid': os.getpid(), 'run': run}))\n"
             "sys.exit(3)\n"
         )
@@ -1133,13 +1132,43 @@ class ReviewStatusTests(Sandbox):
 
         self.assertEqual(code, 0)
 
+    def test_a_run_that_ran_but_whose_status_was_replaced_still_counts_as_started(self) -> None:
+        # As if a second run replaced the status before `--background` read it: the child
+        # ran its slots and exited 3, but no status carries its ID.
+        script = self.root / "replaced_run.py"
+        script.write_text("import sys\nsys.exit(3)\n")
+        with mock.patch("sys.stdout"), mock.patch("sys.stderr"):
+            code = review.status.background(script, [str(self.out)], None, self.out)
+
+        self.assertEqual(code, 0)
+
+    def test_the_hidden_run_option_leaves_short_prefixes_unambiguous(self) -> None:
+        self.release.touch()
+        diff = self.root / "change.patch"
+        diff.write_text("")
+
+        result = self.review("--d", str(diff), env={"EXTERNAL_REVIEWERS": "amp:p/fast"})
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_a_shell_variable_cannot_keep_background_in_the_foreground(self) -> None:
+        # The variable the detached run once recognised; leftover in a shell, it made
+        # `--background` block until the review ended.
+        self.env["XAGENTS_DETACHED_REVIEW"] = "leftover"
+
+        started = self.start("amp:p/slow")
+
+        self.assertEqual(started.returncode, 0, started.stdout + started.stderr)
+        self.assertIn("review started in the background", started.stdout)
+        self.assertEqual(self.status().returncode, 1)
+
     def test_a_status_with_this_runs_pid_but_not_its_id_is_not_taken_as_started(self) -> None:
         # As if the system reused an earlier run's pid: the old status names this child's
         # pid, and the child then fails before it records its own run.
         script = self.root / "failed_start.py"
         script.write_text(
             "import json, os, sys, time\n"
-            "out = sys.argv[-1]\n"
+            "out = sys.argv[1]\n"
             "open(os.path.join(out, 'review-status.json'), 'w').write(json.dumps({'pid': os.getpid(), 'run': 'old'}))\n"
             "time.sleep(0.5)\n"
             "sys.exit(2)\n"
@@ -1151,13 +1180,14 @@ class ReviewStatusTests(Sandbox):
 
     def test_a_malformed_status_counts_as_no_run(self) -> None:
         self.out.mkdir()
-        for slots in (5, [5], [{"chain": 5}], [{"state": "missing", "reasons": [5]}]):
+        for slots in (5, [5], [{"chain": 5}], [{"chain": 0}], [{"chain": {}}], [{"state": "missing", "reasons": [5]}]):
             with self.subTest(slots=slots):
                 (self.out / "review-status.json").write_text(json.dumps({"state": "finished", "slots": slots}))
 
                 result = self.status()
 
                 self.assertEqual(result.returncode, 4, result.stdout + result.stderr)
+                self.assertIn("exists but could not be read as a status", result.stderr)
                 self.assertNotIn("Traceback", result.stderr)
 
     def test_a_foreground_run_with_output_records_its_status_next_to_it(self) -> None:

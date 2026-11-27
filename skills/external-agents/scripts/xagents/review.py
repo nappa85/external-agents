@@ -904,7 +904,7 @@ def review(args: argparse.Namespace) -> int:
              "log": str(path.with_suffix(".log"))}
             for slot, path in zip(panel, paths, strict=True)
         ]  # fmt: skip
-        tracker = status.Tracker(status_file, slots)
+        tracker = status.Tracker(status_file, slots, args.detached_run)
         try:
             code = run_panel(args, source, panel, paths, files, exclude, tracker)
         except BaseException:
@@ -1011,3 +1011,4 @@ def add_parser(commands: argparse._SubParsersAction) -> None:
         action="store_true",
         help="Start the run detached and return once it is under way; follow it with review-status",
     )
+    run.add_argument(status.DETACHED_RUN, dest="detached_run", help=argparse.SUPPRESS)

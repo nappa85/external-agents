@@ -34,10 +34,14 @@ RUNNING, FINISHED = "running", "finished"
 EXIT_RUNNING = 1
 EXIT_NO_RUN = 4
 POLL = 1.0
-# Set in the detached run to an ID that `--background` chose for it. The run records it in
-# its status, so `--background` never takes an earlier run's status, even one whose pid the
+# Passed to the detached run with an ID that `--background` chose for it, as a hidden
+# argument rather than a variable a shell could leave behind. The run records the ID in its
+# status, so `--background` never takes an earlier run's status, even one whose pid the
 # system reused, for this run's; and the run does not detach again.
-ENV_DETACHED = "XAGENTS_DETACHED_REVIEW"
+# No prefix of it a user would type, such as `--d` for `--diff-file`, becomes ambiguous.
+DETACHED_RUN = "--xagents-detached-run"
+# The exit codes of a run that ran its slots; anything else ended it before it started.
+RAN = (0, 3)
 
 
 def status_path(output: Path | None, output_dir: Path | None) -> Path:
@@ -118,7 +122,7 @@ def read(path: Path) -> dict | None:
         return None
     for slot in slots:
         for field in ("chain", "reasons"):
-            value = slot.get(field) or []
+            value = slot.get(field, [])
             if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
                 return None
     return status
@@ -127,13 +131,13 @@ def read(path: Path) -> dict | None:
 class Tracker:
     """Writes a running review's status file; slots update it from their own threads."""
 
-    def __init__(self, path: Path, slots: list[dict]) -> None:
+    def __init__(self, path: Path, slots: list[dict], run: str | None) -> None:
         self.path = path
         self.lock = threading.Lock()
         self.status: dict = {
             "state": RUNNING,
             "pid": os.getpid(),
-            "run": os.environ.get(ENV_DETACHED),
+            "run": run,
             "started": _now(),
             "slots": [{"slot": number, **slot, "state": RUNNING} for number, slot in enumerate(slots, start=1)],
         }
@@ -197,7 +201,8 @@ def review_status(args: argparse.Namespace) -> int:
             if status is not None and status.get("state") == FINISHED:
                 continue
             if status is None:
-                print(f"no review run found: {path} does not exist", file=sys.stderr)
+                why = "exists but could not be read as a status" if path.exists() else "does not exist"
+                print(f"no review run found: {path} {why}", file=sys.stderr)
             else:
                 print("\n".join(describe(status, ended=True)))
             return EXIT_NO_RUN
@@ -227,11 +232,10 @@ def background(script: Path, argv: list[str], output: Path | None, output_dir: P
     run = uuid.uuid4().hex
     with log.open("w") as out:
         child = subprocess.Popen(
-            [sys.executable, "-I", str(script), *argv],
+            [sys.executable, "-I", str(script), *argv, DETACHED_RUN, run],
             stdin=subprocess.DEVNULL,
             stdout=out,
             stderr=subprocess.STDOUT,
-            env={**os.environ, ENV_DETACHED: run},
             start_new_session=True,
         )
     while True:
@@ -239,6 +243,11 @@ def background(script: Path, argv: list[str], output: Path | None, output_dir: P
         # between two polls started, and its outcome is for `review-status`.
         ended = child.poll() is not None
         status = read(path)
+        if ended and child.returncode in RAN and (status is None or status.get("run") != run):
+            # It ran its slots, but a later run already replaced its status, so
+            # `review-status` would report that run instead.
+            print(f"review ran in the background and already ended with exit {child.returncode}; see {log}")
+            return 0
         if status is not None and status.get("run") == run:
             where = f"--output {output}" if output is not None else f"--output-dir {output_dir}"
             print(f"review started in the background (pid {child.pid}); its own output goes to {log}")

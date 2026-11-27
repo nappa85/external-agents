@@ -41,6 +41,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A leftover `XAGENTS_DETACHED_REVIEW` in a shell made `review --background` run in the
+  foreground. The detached run now gets its ID as a hidden argument instead, and
+  `--background` says when a run already ended before it saw its status. A run that
+  ran its slots counts as started even when a second run replaced its status first, and
+  `review-status` names a status file it cannot read instead of saying it does not exist.
 - `review --background` could take an earlier run's status for the new run's when the
   system reused the earlier run's pid, and report the old outcome. It now gives the run an
   ID and accepts only a status that carries it. A status file with malformed slot fields
