@@ -27,7 +27,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from pathlib import Path
 
-from . import sandbox
+from . import sandbox, status
 from .backends import (
     AMP_PLUGINS,
     AMP_SETTINGS,
@@ -878,12 +878,15 @@ def review(args: argparse.Namespace) -> int:
     check_includes(source, args.include)
     paths = output_paths(args, len(panel))
     # The review's own inputs and outputs stay out of what the reviewers see: the supplied
-    # diff only after filtering, and no earlier review or its patch.
+    # diff only after filtering, and no earlier review, its patch, or a run's status.
     exclude = [
         *([args.diff_file] if args.diff_file else []),
         *(path.with_suffix(suffix) for path in paths for suffix in (".md", ".log", ".patch")),
         *paths,
+        *status.run_files(paths),
     ]
+    # Prepared before the run records its status, so a bad input, such as an unknown
+    # --base, is a usage error (exit 2) and never looks like a run.
     files = {PROMPT_FILE: args.prompt_file.read_text()}
     if args.base:
         patch = base_diff(source, args.base, exclude)
@@ -893,32 +896,75 @@ def review(args: argparse.Namespace) -> int:
         patch = None
     if patch is not None:
         files[DIFF_FILE], files[FILES_FILE] = filter_patch(patch)
+    status_file = status.status_path(args.output, args.output_dir)
+    with status.hold(status.lock_path(args.output, args.output_dir)):
+        status_file.unlink(missing_ok=True)
+        slots = [
+            {"optional": slot.optional, "chain": [r.label for r in slot.reviewers], "review": str(path),
+             "log": str(path.with_suffix(".log"))}
+            for slot, path in zip(panel, paths, strict=True)
+        ]  # fmt: skip
+        tracker = status.Tracker(status_file, slots)
+        try:
+            code = run_panel(args, source, panel, paths, files, exclude, tracker)
+        except BaseException:
+            tracker.finish(2)
+            raise
+        tracker.finish(code)
+        return code
+
+
+def finish_slot(
+    number: int, slot: Slot, path: Path, result: tuple[Reviewer | None, str, bytes], tracker: status.Tracker
+) -> None:
+    """Write a finished slot's review, or why it has none, and record its outcome."""
+    reviewer, output, changes = result
+    kind = "optional slot" if slot.optional else "slot"
+    if reviewer is None:
+        path.write_text(f"no reviewer available:\n{output}\n")
+        print(f"{kind} {number}: no reviewer available; see {path}", file=sys.stderr)
+        # The first line of each attempt's entry, such as `codex: unavailable (exit 1)`.
+        labels = tuple(f"{r.label}: " for r in slot.reviewers)
+        reasons = [line for line in output.splitlines() if line.startswith(labels)] if labels else []
+        tracker.slot(number, state="missing", reasons=reasons or output.splitlines()[:1])
+        return
+    text = f"reviewer: {reviewer.label}\n{output}"
+    patch_path = None
+    if changes:
+        patch_path = path.with_suffix(".patch")
+        patch_path.write_bytes(changes)
+        text = f"{text.rstrip()}\n\nproposed changes: {patch_path.name}\n"
+        print(f"{kind} {number}: {reviewer.label} proposed changes in {patch_path}", file=sys.stderr)
+    path.write_text(text)
+    print(f"{kind} {number}: review by {reviewer.label} written to {path}", file=sys.stderr)
+    tracker.slot(number, state="written", reviewer=reviewer.label, patch=str(patch_path) if patch_path else None)
+
+
+def run_panel(
+    args: argparse.Namespace,
+    source: Path,
+    panel: list[Slot],
+    paths: list[Path],
+    files: dict[str, str],
+    exclude: list[Path],
+    tracker: status.Tracker,
+) -> int:
     logs = [path.with_suffix(".log") for path in paths]
     for path, log in zip(paths, logs, strict=True):
         log.write_text("")
         # A patch left by an earlier review next to this output would look like this one's.
         path.with_suffix(".patch").unlink(missing_ok=True)
     print(f"raw reviewer output, written as it arrives: {', '.join(map(str, logs))}", file=sys.stderr)
+
+    def run(number: int, slot: Slot, path: Path, log: Path) -> tuple[Reviewer | None, str, bytes]:
+        # Written as soon as the slot ends, so `review-status` sees it before slower slots.
+        result = review_slot(slot, args, source, files, exclude, log)
+        finish_slot(number, slot, path, result, tracker)
+        return result
+
     with ThreadPoolExecutor(max_workers=len(panel)) as pool:
-        results = list(pool.map(lambda slot, log: review_slot(slot, args, source, files, exclude, log), panel, logs))
-    complete = True
-    for number, (slot, path, (reviewer, output, changes)) in enumerate(
-        zip(panel, paths, results, strict=True), start=1
-    ):
-        kind = "optional slot" if slot.optional else "slot"
-        if reviewer is None:
-            path.write_text(f"no reviewer available:\n{output}\n")
-            print(f"{kind} {number}: no reviewer available; see {path}", file=sys.stderr)
-            complete = complete and slot.optional
-            continue
-        text = f"reviewer: {reviewer.label}\n{output}"
-        if changes:
-            patch_path = path.with_suffix(".patch")
-            patch_path.write_bytes(changes)
-            text = f"{text.rstrip()}\n\nproposed changes: {patch_path.name}\n"
-            print(f"{kind} {number}: {reviewer.label} proposed changes in {patch_path}", file=sys.stderr)
-        path.write_text(text)
-        print(f"{kind} {number}: review by {reviewer.label} written to {path}", file=sys.stderr)
+        results = list(pool.map(run, range(1, len(panel) + 1), panel, paths, logs))
+    complete = all(slot.optional or reviewer is not None for slot, (reviewer, _, _) in zip(panel, results, strict=True))
     if not complete or all(reviewer is None for reviewer, _, _ in results):
         print("A required external reviewer is missing; record the reduced panel.", file=sys.stderr)
         return 3
@@ -960,3 +1006,8 @@ def add_parser(commands: argparse._SubParsersAction) -> None:
         "high doubles it, xhigh and max triple it",
     )
     run.add_argument("--no-preflight", action="store_true")
+    run.add_argument(
+        "--background",
+        action="store_true",
+        help="Start the run detached and return once it is under way; follow it with review-status",
+    )

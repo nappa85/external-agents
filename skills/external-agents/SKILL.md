@@ -24,7 +24,7 @@ python3 -I <skill-dir>/scripts/external_agents.py <command> ...
 ```
 
 `<skill-dir>` is the directory holding this file. Commands: `detect`, `install`,
-`review`, `code`, `question`, `answer`; `--help` on each lists its options.
+`review`, `review-status`, `code`, `question`, `answer`; `--help` on each lists its options.
 
 ## 1. Check what is configured
 
@@ -68,13 +68,28 @@ Independence rules, which apply to every reviewer, external or your own subagent
 
 Write the reviewer prompt to a file. External reviewers find it in their snapshot as
 `REVIEW_PROMPT.md`, the diff as `REVIEW_DIFF.patch` and the changed paths as
-`REVIEW_FILES.txt`. They have no VCS, so tell them to use those files. Then run, in the
-background:
+`REVIEW_FILES.txt`. They have no VCS, so tell them to use those files. Then start the
+panel with `--background`, which returns once the run is under way, and launch your own
+subagent:
 
 ```bash
-python3 -I <skill-dir>/scripts/external_agents.py review \
+python3 -I <skill-dir>/scripts/external_agents.py review --background \
   --prompt-file "$PROMPT" --output-dir "$OUT_DIR" --base main
 ```
+
+Never judge from memory whether the run is still going. Run `review-status`, in the
+background next to your subagent, to wait for its end:
+
+```bash
+python3 -I <skill-dir>/scripts/external_agents.py review-status --wait --output-dir "$OUT_DIR"
+```
+
+It prints one line per slot, `written by <reviewer> to <file>` or `missing, no reviewer
+available (<why>)`, and exits with the run's own exit code: 0, 3, or 2 when the wrapper
+itself failed. Without `--wait` it reports the slots finished so far and exits 1 while the
+run goes on. Exit 4 means there is no run, or it was killed before it finished: read
+`review-run.log` and the slots' logs, then start it again. Act on the reviews only after `review-status` reports the run
+finished.
 
 Each slot writes `review-<n>.md`, whose first line names the reviewer, and
 `review-<n>.log`, the raw output of its runs as they happen. A reviewer that

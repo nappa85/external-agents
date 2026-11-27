@@ -1,0 +1,241 @@
+"""The progress of a `review` run, for a coordinator that runs it in the background.
+
+A run writes a status file next to its reviews: `review-status.json` in `--output-dir`,
+or `<name>.status.json` next to `--output`. It names each slot's outcome as the slot
+finishes, and the run's exit code at the end. For its whole life the run holds a lock on
+its first slot's log, so `review-status` tells a run that is still going from one that was
+killed before it could record its end.
+
+`review --background` starts the run detached, with its own output in `review-run.log`
+(`<name>.run.log`), and returns once the run has written its status. `review-status`
+prints that status; with `--wait`, it blocks until the run ends.
+"""
+
+from __future__ import annotations
+
+import argparse
+import contextlib
+import datetime as dt
+import fcntl
+import json
+import os
+import subprocess
+import sys
+import threading
+import time
+from collections.abc import Iterator
+from pathlib import Path
+
+from .common import UsageError, replace_atomically
+
+RUNNING, FINISHED = "running", "finished"
+# `review-status`: the run is still going; no run, or it ended without recording its end.
+EXIT_RUNNING = 1
+EXIT_NO_RUN = 4
+POLL = 1.0
+# Set in the detached run, so it runs the review instead of detaching again.
+ENV_DETACHED = "XAGENTS_DETACHED_REVIEW"
+
+
+def status_path(output: Path | None, output_dir: Path | None) -> Path:
+    return output.with_suffix(".status.json") if output is not None else Path(output_dir or ".") / "review-status.json"
+
+
+def run_log_path(output: Path | None, output_dir: Path | None) -> Path:
+    return output.with_suffix(".run.log") if output is not None else Path(output_dir or ".") / "review-run.log"
+
+
+def lock_path(output: Path | None, output_dir: Path | None) -> Path:
+    """The first slot's log, which exists for as long as the run."""
+    return output.with_suffix(".log") if output is not None else Path(output_dir or ".") / "review-1.log"
+
+
+def run_files(reviews: list[Path]) -> list[Path]:
+    """The status and run log files a run with these review files may find next to them,
+    under either layout, so a reviewer sees no earlier run's status either."""
+    files = []
+    for review in reviews:
+        files += [review.with_suffix(".status.json"), review.with_suffix(".run.log")]
+        files += [status_path(None, review.parent), run_log_path(None, review.parent)]
+    return list(dict.fromkeys(files))
+
+
+def _now() -> str:
+    return dt.datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+def _try_lock(fd: int, mode: int = fcntl.LOCK_EX) -> bool:
+    try:
+        fcntl.flock(fd, mode | fcntl.LOCK_NB)
+    except BlockingIOError:
+        return False
+    return True
+
+
+@contextlib.contextmanager
+def hold(lock: Path) -> Iterator[None]:
+    """Hold the run's lock, or refuse a second run into the same outputs."""
+    fd = os.open(lock, os.O_RDWR | os.O_CREAT, 0o644)
+    try:
+        # A `review-status` that is checking the lock holds it for a moment.
+        for _ in range(20):
+            if _try_lock(fd):
+                break
+            time.sleep(0.05)
+        else:
+            raise UsageError(f"a review is already running with these outputs; it holds {lock}")
+        yield
+    finally:
+        os.close(fd)
+
+
+def alive(lock: Path) -> bool:
+    """Whether a run holds `lock`."""
+    try:
+        fd = os.open(lock, os.O_RDONLY)
+    except FileNotFoundError:
+        return False
+    try:
+        # Shared: probes must not see each other as a run.
+        return not _try_lock(fd, fcntl.LOCK_SH)
+    finally:
+        os.close(fd)
+
+
+def read(path: Path) -> dict | None:
+    try:
+        status = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return None
+    return status if isinstance(status, dict) else None
+
+
+class Tracker:
+    """Writes a running review's status file; slots update it from their own threads."""
+
+    def __init__(self, path: Path, slots: list[dict]) -> None:
+        self.path = path
+        self.lock = threading.Lock()
+        self.status: dict = {
+            "state": RUNNING,
+            "pid": os.getpid(),
+            "started": _now(),
+            "slots": [{"slot": number, **slot, "state": RUNNING} for number, slot in enumerate(slots, start=1)],
+        }
+        self._write()
+
+    def _write(self) -> None:
+        replace_atomically(self.path, json.dumps(self.status, indent=2) + "\n")
+
+    def slot(self, number: int, **fields: object) -> None:
+        with self.lock:
+            self.status["slots"][number - 1].update(fields)
+            self._write()
+
+    def finish(self, code: int) -> None:
+        with self.lock:
+            self.status.update(state=FINISHED, finished=_now(), exit=code)
+            self._write()
+
+
+def describe(status: dict, ended: bool = False) -> list[str]:
+    """One line for the run, then one per slot."""
+    if status.get("state") == FINISHED:
+        lines = [f"review finished at {status.get('finished')}, exit {status.get('exit')}"]
+    elif ended:
+        lines = ["review ended without finishing: it was killed or crashed; see its run log and each slot's log"]
+    else:
+        lines = [f"review running since {status.get('started')}, pid {status.get('pid')}"]
+    for slot in status.get("slots", []):
+        kind = "optional slot" if slot.get("optional") else "slot"
+        head = f"{kind} {slot.get('slot')}"
+        if slot.get("state") == "written":
+            patch = f"; proposed changes in {slot['patch']}" if slot.get("patch") else ""
+            lines.append(f"{head}: written by {slot.get('reviewer')} to {slot.get('review')}{patch}")
+        elif slot.get("state") == "missing":
+            reasons = "; ".join(slot.get("reasons") or []) or "no reason recorded"
+            lines.append(f"{head}: missing, no reviewer available ({reasons}); see {slot.get('review')}")
+        elif ended or status.get("state") == FINISHED:
+            lines.append(f"{head}: never finished; see {slot.get('log')}")
+        else:
+            lines.append(f"{head}: running ({', '.join(slot.get('chain') or [])}); output so far in {slot.get('log')}")
+    return lines
+
+
+def review_status(args: argparse.Namespace) -> int:
+    """Print a review run's status: its exit code once it finished, EXIT_RUNNING while it
+    runs (after `--timeout`, with `--wait`), EXIT_NO_RUN without a run or when the run
+    ended without finishing."""
+    path = status_path(args.output, args.output_dir)
+    lock = lock_path(args.output, args.output_dir)
+    deadline = None if args.timeout is None else time.monotonic() + args.timeout
+    while True:
+        status = read(path)
+        if status is not None and status.get("state") == FINISHED:
+            print("\n".join(describe(status)))
+            code = status.get("exit")
+            return code if isinstance(code, int) else EXIT_NO_RUN
+        running = alive(lock)
+        if not running:
+            # The run may have finished between the two reads.
+            status = read(path)
+            if status is not None and status.get("state") == FINISHED:
+                continue
+            if status is None:
+                print(f"no review run found: {path} does not exist", file=sys.stderr)
+            else:
+                print("\n".join(describe(status, ended=True)))
+            return EXIT_NO_RUN
+        if not args.wait or (deadline is not None and time.monotonic() >= deadline):
+            # A run that holds the lock but has no status yet is still preparing its snapshot.
+            print("\n".join(describe(status)) if status is not None else "review starting")
+            return EXIT_RUNNING
+        time.sleep(POLL if deadline is None else max(0.0, min(POLL, deadline - time.monotonic())))
+
+
+def background(script: Path, argv: list[str], output: Path | None, output_dir: Path | None) -> int:
+    """Start `review` detached and return once it has written its status, or with its
+    exit code when it ends first, such as on a usage error."""
+    lock = lock_path(output, output_dir)
+    if alive(lock):
+        raise UsageError(f"a review is already running with these outputs; it holds {lock}")
+    if output is not None and not output.parent.is_dir():
+        raise UsageError(f"cannot use --output {output}: {output.parent} is not a directory")
+    try:
+        (output_dir or Path(".")).mkdir(parents=True, exist_ok=True)
+    except OSError as error:
+        raise UsageError(f"cannot use --output-dir {output_dir}: {error}") from error
+    log = run_log_path(output, output_dir)
+    path = status_path(output, output_dir)
+    # An earlier run's status would read as this run's outcome.
+    path.unlink(missing_ok=True)
+    with log.open("w") as out:
+        child = subprocess.Popen(
+            [sys.executable, "-I", str(script), *argv],
+            stdin=subprocess.DEVNULL,
+            stdout=out,
+            stderr=subprocess.STDOUT,
+            env={**os.environ, ENV_DETACHED: "1"},
+            start_new_session=True,
+        )
+    while child.poll() is None:
+        status = read(path)
+        if status is not None and status.get("pid") == child.pid:
+            where = f"--output {output}" if output is not None else f"--output-dir {output_dir}"
+            print(f"review running in the background (pid {child.pid}); its own output goes to {log}")
+            print(f"wait for it with: {script.name} review-status --wait {where}")
+            return 0
+        time.sleep(0.1)
+    sys.stderr.write(log.read_text())
+    return child.returncode
+
+
+def add_parser(commands: argparse._SubParsersAction) -> None:
+    run = commands.add_parser(
+        "review-status", help="Print a review run's outcome per slot; --wait blocks until the run ends"
+    )
+    outputs = run.add_mutually_exclusive_group(required=True)
+    outputs.add_argument("--output", type=Path, help="The run's --output")
+    outputs.add_argument("--output-dir", type=Path, help="The run's --output-dir")
+    run.add_argument("--wait", action="store_true", help="Block until the run ends")
+    run.add_argument("--timeout", type=float, help="With --wait, give up after this many seconds (exit 1)")

@@ -111,6 +111,10 @@ X=skills/external-agents/scripts/external_agents.py
 # Review the changes since main with the configured panel
 python3 -I $X review --prompt-file prompt.md --output-dir reviews/ --base main
 
+# The same in the background, then wait for it: one line per slot, the run's exit code
+python3 -I $X review --background --prompt-file prompt.md --output-dir reviews/ --base main
+python3 -I $X review-status --wait --output-dir reviews/
+
 # Run a coding agent on a fresh worktree
 git worktree add -b feature ../wt/feature main
 python3 -I $X code --worktree ../wt/feature --task task.md --state ~/.cache/xagents/feature &

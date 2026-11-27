@@ -38,7 +38,12 @@ class Exclusions:
 
     def __contains__(self, path: Path) -> bool:
         real = Path(os.path.realpath(path))
-        return real in self.paths or any(parent in self.paths for parent in real.parents)
+        # `.name.*` is a temporary copy that `replace_atomically` renames over `name`.
+        return (
+            real in self.paths
+            or any(parent in self.paths for parent in real.parents)
+            or any(p.parent == real.parent and real.name.startswith(f".{p.name}.") for p in self.paths)
+        )
 
 
 def copy_entry(source: Path, dest: Path, relative: Path) -> None:
@@ -60,7 +65,9 @@ def copy_entry(source: Path, dest: Path, relative: Path) -> None:
         if not os.path.isabs(link) and resolved.is_relative_to(root) and not is_secret(resolved.relative_to(root)):
             os.symlink(link, target)
         return
-    shutil.copy2(origin, target)
+    # A file the review itself writes, such as its status, may be renamed away meanwhile.
+    with contextlib.suppress(FileNotFoundError):
+        shutil.copy2(origin, target)
 
 
 def check_includes(source: Path, extra: list[Path]) -> list[Path]:

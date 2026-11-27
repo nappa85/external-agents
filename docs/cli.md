@@ -107,13 +107,32 @@ Runs the panel on a snapshot of a Git checkout.
 | `--timeout S`             | per-attempt limit (default 1800)                                                |
 | `--idle-timeout S`        | kill after S seconds of silence (default 300, ×2 at `@high`, ×3 above; not `claude`) |
 | `--no-preflight`          | skip the "Reply with exactly: PONG" check before each reviewer                  |
+| `--background`            | start detached, output in `review-run.log`; return once the run is under way    |
 
 The snapshot also holds `REVIEW_FILES.txt`, the changed paths with a status letter
 (`A`, `M`, `D`, `R`). A reviewer that changes files leaves `review-<n>.patch`, which
 applies with `git apply`.
 
+Every run records its progress in `review-status.json` (`<name>.status.json` next to
+`--output`) and holds a lock on its first slot's log while it runs; a second run into the
+same outputs is refused.
+
 Exit: 0 every required slot produced a review; 3 a required slot had none (its file
-says why); 2 usage error.
+says why); 2 usage error, or another run writes to the same outputs.
+
+## `review-status`
+
+Prints a review run's state and one line per slot: written (reviewer, file, patch),
+missing (each reviewer's failure), or running (its chain and log).
+
+| Option             | Meaning                                                  |
+| ------------------ | -------------------------------------------------------- |
+| `--output-dir DIR` | the run's `--output-dir` (or `--output FILE`)            |
+| `--wait`           | block until the run ends                                 |
+| `--timeout S`      | with `--wait`, stop waiting after S seconds              |
+
+Exit: the run's exit code once it finished; 1 while it runs; 4 no run, or it ended
+without finishing (killed or crashed).
 
 ## `code`
 
