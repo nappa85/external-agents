@@ -825,6 +825,10 @@ def output_paths(args: argparse.Namespace, count: int) -> list[Path]:
             raise UsageError(f"--output must not end in {args.output.suffix}; the wrapper writes that file")
         if count != 1:
             raise UsageError(f"the panel has {count} slots; pass --output-dir instead of --output")
+        if re.fullmatch(r"review-(\d+|status|run)", args.output.stem):
+            raise UsageError(
+                f"--output {args.output}: names like review-1.md are --output-dir's files; pick another name"
+            )
         if not args.output.parent.is_dir():
             raise UsageError(f"cannot use --output {args.output}: {args.output.parent} is not a directory")
         return [args.output]

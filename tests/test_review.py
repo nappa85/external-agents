@@ -4,6 +4,7 @@ import argparse
 import io
 import json
 import os
+import shlex
 import shutil
 import stat
 import subprocess
@@ -690,7 +691,10 @@ class ReviewerSelectionTests(Sandbox):
             "! grep -qF reviews/review-1. REVIEW_DIFF.patch REVIEW_FILES.txt && echo independent review",
         )
 
-        result = self.review("--base", "HEAD")
+        result = self.run_script(
+            "review", "--prompt-file", str(self.prompt), "--no-preflight", "--reviewer", "claude",
+            "--output-dir", str(self.output.parent), "--base", "HEAD",
+        )  # fmt: skip
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("independent review", self.output.read_text())
@@ -1008,7 +1012,13 @@ class ReviewStatusTests(Sandbox):
         self.assertEqual(timed_out.returncode, 1, timed_out.stderr)
 
         self.release.touch()
-        done = self.status("--wait", "--timeout", "30")
+        # Exactly the command `--background` printed, which names this run.
+        printed = started.stdout.split("wait for it with: ", 1)[1].strip()
+        run = json.loads((self.out / "review-status.json").read_text())["run"]
+        self.assertIn(f"--run {run}", printed)
+        done = subprocess.run(
+            [*shlex.split(printed), "--timeout", "30"], cwd=self.repo, capture_output=True, text=True, env=self.env
+        )
 
         self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
         self.assertTrue(done.stdout.startswith("review finished at "), done.stdout)
@@ -1136,7 +1146,8 @@ class ReviewStatusTests(Sandbox):
 
         self.assertEqual(code, 0)
         self.assertIn("review started in the background", out.getvalue())
-        self.assertIn("review-status --wait --output-dir", out.getvalue())
+        run = json.loads((self.out / "review-status.json").read_text())["run"]
+        self.assertIn(f"review-status --wait --output-dir {self.out} --run {run}", out.getvalue())
 
     def test_a_run_that_ran_but_whose_status_was_replaced_still_counts_as_started(self) -> None:
         # As if a second run replaced the status before `--background` read it: the child
@@ -1166,26 +1177,72 @@ class ReviewStatusTests(Sandbox):
 
     def test_status_with_a_run_id_does_not_report_a_later_run(self) -> None:
         self.out.mkdir()
-        later = {"state": "finished", "finished": "now", "exit": 0, "run": "later", "slots": []}
-        (self.out / "review-status.json").write_text(json.dumps(later))
+        for state in ("finished", "running", None):
+            with self.subTest(later=state):
+                path = self.out / "review-status.json"
+                path.unlink(missing_ok=True)
+                if state is not None:
+                    later = {"state": state, "finished": "now", "exit": 0, "run": "later", "slots": []}
+                    path.write_text(json.dumps(later))
 
-        result = self.status("--wait", "--run", "mine")
+                result = self.status("--wait", "--run", "mine")
 
-        self.assertEqual(result.returncode, 4, result.stdout + result.stderr)
-        self.assertIn("was replaced by a later run", result.stderr)
-        self.assertEqual(self.status("--run", "later").returncode, 0)
+                self.assertEqual(result.returncode, 4, result.stdout + result.stderr)
+                self.assertIn("was replaced by a later run", result.stderr)
+        self.assertEqual(self.status("--run", "").returncode, 2)
 
-    def test_a_run_that_takes_the_lock_between_probe_and_read_is_not_reported_killed(self) -> None:
+    def test_a_status_that_changes_during_the_lock_probe_is_read_again(self) -> None:
         self.out.mkdir()
+        path = self.out / "review-status.json"
         slot = {"slot": 1, "chain": ["amp:p/fast"], "state": "running", "log": "review-1.log"}
-        (self.out / "review-status.json").write_text(json.dumps({"state": "running", "slots": [slot]}))
-        args = argparse.Namespace(output=None, output_dir=self.out, wait=False, timeout=None, run=None)
+        path.write_text(json.dumps({"state": "running", "run": "mine", "slots": [slot]}))
 
-        # The first probe finds no holder; the new run holds the lock by the second.
-        with mock.patch.object(review.status, "alive", side_effect=[False, True, True]), mock.patch("sys.stdout"):
+        def finish_during_probe(_: Path) -> bool:
+            # The run finishes and releases its lock while the probe runs.
+            path.write_text(json.dumps({"state": "finished", "finished": "now", "exit": 3, "run": "mine", "slots": []}))
+            return False
+
+        args = argparse.Namespace(output=None, output_dir=self.out, wait=False, timeout=None, run="mine")
+        with mock.patch.object(review.status, "alive", finish_during_probe), mock.patch("sys.stdout"):
             code = review.status.review_status(args)
 
-        self.assertEqual(code, 1)
+        self.assertEqual(code, 3)
+
+    @unittest.skipIf(os.geteuid() == 0, "root traverses any directory")
+    def test_an_untraversable_output_directory_counts_as_no_run(self) -> None:
+        self.out.mkdir()
+        (self.out / "review-status.json").write_text("{}")
+        self.out.chmod(0)
+        self.addCleanup(self.out.chmod, 0o755)
+
+        result = self.status()
+        started = self.start("amp:p/fast")
+
+        self.assertEqual(result.returncode, 4, result.stdout + result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+        self.assertEqual(started.returncode, 2, started.stdout + started.stderr)
+        self.assertNotIn("Traceback", started.stderr)
+
+    def test_a_launch_that_loses_the_race_leaves_the_winners_run_log_alone(self) -> None:
+        self.out.mkdir()
+        (self.out / "review-run.log").write_text("the winner's output\n")
+        script = self.root / "loser.py"
+        script.write_text("import sys\nprint('error: a review is already running')\nsys.exit(2)\n")
+        with mock.patch("sys.stderr"):
+            code = review.status.background(script, [str(self.out)], None, self.out)
+
+        self.assertEqual(code, 2)
+        self.assertEqual((self.out / "review-run.log").read_text(), "the winner's output\n")
+        self.assertEqual(sorted(p.name for p in self.out.iterdir()), ["review-run.log"])
+
+    def test_an_output_named_like_an_output_dir_file_is_refused(self) -> None:
+        for name in ("review-1.md", "review-status.md", "review-run.md"):
+            with self.subTest(name=name):
+                self.output = self.root / name
+
+                result = self.review(env={"EXTERNAL_REVIEWERS": "amp:p/fast"})
+
+                self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
 
     def test_the_hidden_run_option_leaves_short_prefixes_unambiguous(self) -> None:
         self.release.touch()

@@ -19,6 +19,7 @@ import datetime as dt
 import fcntl
 import json
 import os
+import shlex
 import subprocess
 import sys
 import threading
@@ -181,46 +182,59 @@ def describe(status: dict, ended: bool = False) -> list[str]:
     return lines
 
 
+def _missing(path: Path) -> str:
+    try:
+        os.lstat(path)
+    except (FileNotFoundError, NotADirectoryError):
+        return "does not exist"
+    except OSError as error:
+        return f"could not be read: {error}"
+    return "exists but could not be read as a status"
+
+
 def review_status(args: argparse.Namespace) -> int:
     """Print a review run's status: its exit code once it finished, EXIT_RUNNING while it
-    runs (after `--timeout`, with `--wait`), EXIT_NO_RUN without a run or when the run
-    ended without finishing."""
+    runs (after `--timeout`, with `--wait`), EXIT_NO_RUN without a run, when the run ended
+    without finishing, or, with `--run`, when a later run replaced that run."""
     path = status_path(args.output, args.output_dir)
     lock = lock_path(args.output, args.output_dir)
     deadline = None if args.timeout is None else time.monotonic() + args.timeout
-    while True:
-        status = read(path)
-        if args.run is not None and status is not None and status.get("run") != args.run:
-            # A later run into the same outputs replaced this run's status and reviews.
-            print(
-                f"run {args.run} was replaced by a later run into the same outputs; its reviews are gone",
-                file=sys.stderr,
-            )
-            return EXIT_NO_RUN
-        if status is not None and status.get("state") == FINISHED:
-            print("\n".join(describe(status)))
-            code = status.get("exit")
-            # bool is an int too, but never an exit code this script wrote.
-            return code if isinstance(code, int) and not isinstance(code, bool) else EXIT_NO_RUN
-        running = alive(lock)
-        if not running:
-            # The run may have finished between the two reads.
+    try:
+        while True:
             status = read(path)
-            # A new run may have taken the lock between the probe and this read.
-            if (status is not None and status.get("state") == FINISHED) or alive(lock):
+            # `--background` prints `--run` only once the run's status exists, so a missing
+            # status or another run's is never this run's.
+            if args.run is not None and (status is None or status.get("run") != args.run):
+                print(
+                    f"run {args.run} was replaced by a later run into the same outputs, or its status is gone; "
+                    "its reviews and logs are not its own any more",
+                    file=sys.stderr,
+                )
+                return EXIT_NO_RUN
+            if status is not None and status.get("state") == FINISHED:
+                print("\n".join(describe(status)))
+                code = status.get("exit")
+                # bool is an int too, but never an exit code this script wrote.
+                return code if isinstance(code, int) and not isinstance(code, bool) else EXIT_NO_RUN
+            running = alive(lock)
+            # The probe answers for the status read before it only if nothing changed
+            # meanwhile, such as the run finishing or a later run taking its place.
+            if read(path) != status:
                 continue
-            if status is None:
-                # os.path.lexists never raises, unlike Path.exists on an untraversable path.
-                why = "exists but could not be read as a status" if os.path.lexists(path) else "does not exist"
-                print(f"no review run found: {path} {why}", file=sys.stderr)
-            else:
-                print("\n".join(describe(status, ended=True)))
-            return EXIT_NO_RUN
-        if not args.wait or (deadline is not None and time.monotonic() >= deadline):
-            # A run that holds the lock but has no status yet is still preparing its snapshot.
-            print("\n".join(describe(status)) if status is not None else "review starting")
-            return EXIT_RUNNING
-        time.sleep(POLL if deadline is None else max(0.0, min(POLL, deadline - time.monotonic())))
+            if not running:
+                if status is None:
+                    print(f"no review run found: {path} {_missing(path)}", file=sys.stderr)
+                else:
+                    print("\n".join(describe(status, ended=True)))
+                return EXIT_NO_RUN
+            if not args.wait or (deadline is not None and time.monotonic() >= deadline):
+                # A run that holds the lock but has no status yet is still preparing its snapshot.
+                print("\n".join(describe(status)) if status is not None else "review starting")
+                return EXIT_RUNNING
+            time.sleep(POLL if deadline is None else max(0.0, min(POLL, deadline - time.monotonic())))
+    except OSError as error:
+        print(f"cannot follow the review run in {path.parent}: {error}", file=sys.stderr)
+        return EXIT_NO_RUN
 
 
 def background(script: Path, argv: list[str], output: Path | None, output_dir: Path | None) -> int:
@@ -228,7 +242,11 @@ def background(script: Path, argv: list[str], output: Path | None, output_dir: P
     its slots even if a later run already replaced its status; otherwise, such as on a usage
     error, return its exit code."""
     lock = lock_path(output, output_dir)
-    if alive(lock):
+    try:
+        running = alive(lock)
+    except OSError as error:
+        raise UsageError(f"cannot use the outputs in {lock.parent}: {error}") from error
+    if running:
         raise UsageError(f"a review is already running with these outputs; it holds {lock}")
     if output is not None and not output.parent.is_dir():
         raise UsageError(f"cannot use --output {output}: {output.parent} is not a directory")
@@ -236,12 +254,19 @@ def background(script: Path, argv: list[str], output: Path | None, output_dir: P
         (output_dir or Path(".")).mkdir(parents=True, exist_ok=True)
     except OSError as error:
         raise UsageError(f"cannot use --output-dir {output_dir}: {error}") from error
-    log = run_log_path(output, output_dir)
     # The run replaces an earlier run's status under its lock; one without this run's ID is
     # never taken for this run's.
     path = status_path(output, output_dir)
     run = uuid.uuid4().hex
-    with log.open("w") as out:
+    log = run_log_path(output, output_dir)
+    # The child writes to a log of its own, a name snapshots leave out, until its status
+    # shows it holds the outputs; a launch that loses a race leaves the winner's log alone.
+    private = log.with_name(f".{log.name}.{run}")
+    try:
+        out = private.open("x")
+    except OSError as error:
+        raise UsageError(f"cannot write the run log {private}: {error}") from error
+    with out:
         child = subprocess.Popen(
             [sys.executable, "-I", str(script), *argv, DETACHED_RUN, run],
             stdin=subprocess.DEVNULL,
@@ -255,23 +280,33 @@ def background(script: Path, argv: list[str], output: Path | None, output_dir: P
         ended = child.poll() is not None
         status = read(path)
         if ended and child.returncode in RAN and (status is None or status.get("run") != run):
-            # It ran its slots, but a later run already replaced its status, reviews and
-            # run log, so `review-status` would report that run instead.
+            # It ran its slots, but a later run already replaced its status and reviews, so
+            # `review-status` would report that run instead.
             print(
                 f"review ran in the background and already ended with exit {child.returncode}; a later run into "
-                "the same outputs replaced its status and reviews, so do not run review-status for it"
+                f"the same outputs replaced its status and reviews, so do not run review-status for it; "
+                f"its own output is in {private}"
             )
             return 0
         if status is not None and status.get("run") == run:
-            where = f"--output {output}" if output is not None else f"--output-dir {output_dir}"
+            os.replace(private, log)
+            where = ["--output", str(output)] if output is not None else ["--output-dir", str(output_dir)]
+            command = [sys.executable, "-I", str(script), "review-status", "--wait", *where, "--run", run]
             print(f"review started in the background (pid {child.pid}); its own output goes to {log}")
-            print(f"wait for it with: {script.name} review-status --wait {where} --run {run}")
+            print(f"wait for it with: {shlex.join(command)}")
             return 0
         if ended:
             # It ended without recording a run, such as on a usage error.
-            sys.stderr.write(log.read_text())
+            sys.stderr.write(private.read_text())
+            private.unlink(missing_ok=True)
             return child.returncode
         time.sleep(0.1)
+
+
+def run_id(text: str) -> str:
+    if not text:
+        raise argparse.ArgumentTypeError("must not be empty; pass the ID --background printed")
+    return text
 
 
 def add_parser(commands: argparse._SubParsersAction) -> None:
@@ -282,5 +317,7 @@ def add_parser(commands: argparse._SubParsersAction) -> None:
     outputs.add_argument("--output", type=Path, help="The run's --output")
     outputs.add_argument("--output-dir", type=Path, help="The run's --output-dir")
     run.add_argument("--wait", action="store_true", help="Block until the run ends")
-    run.add_argument("--run", help="The run ID that --background printed; a later run into the same outputs exits 4")
+    run.add_argument(
+        "--run", type=run_id, help="The run ID that --background printed; a later run into the same outputs exits 4"
+    )
     run.add_argument("--timeout", type=float, help="With --wait, give up after this many seconds (exit 1)")

@@ -11,7 +11,7 @@ reviewers or as sandboxed coding agents.
 
 Exit codes: 0 success; 2 usage or setup error; 3 (review) a required reviewer slot had no
 available reviewer; for `review-status`, the run's exit code once it finished, 1 while it
-runs, 4 when there is no run or it ended without finishing; the coding agent's own exit code, or 124 on timeout, for `code`;
+runs, 4 when there is no run, it ended without finishing, or a later run replaced it; the coding agent's own exit code, or 124 on timeout, for `code`;
 1 (question) none waiting; 4 (question, answer) no active run.
 """
 

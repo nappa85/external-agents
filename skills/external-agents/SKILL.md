@@ -77,12 +77,13 @@ python3 -I <skill-dir>/scripts/external_agents.py review --background \
   --prompt-file "$PROMPT" --output-dir "$OUT_DIR" --base main
 ```
 
-Never judge from memory whether the run is still going. Run the `review-status` command
-that `--background` printed, in the background next to your subagent, to wait for its end;
-its `--run` names this run, so a later run into the same directory is never taken for it:
+Never judge from memory whether the run is still going. `--background` prints a line
+`wait for it with: <command>`. Run exactly that command, in the background next to your
+subagent, to wait for the run's end. It looks like this, and its `--run` names this run, so
+a later run into the same directory is never taken for it:
 
 ```bash
-python3 -I <skill-dir>/scripts/external_agents.py review-status --wait --output-dir "$OUT_DIR" --run "$RUN"
+/usr/bin/python3 -I <skill-dir>/scripts/external_agents.py review-status --wait --output-dir out --run 83eb06...
 ```
 
 If `--background` instead says the run already ended, its exit code is the outcome: a later
@@ -91,9 +92,10 @@ run replaced the reviews, so start the review again.
 It prints one line per slot, `written by <reviewer> to <file>` or `missing, no reviewer
 available (<why>)`, and exits with the run's own exit code: 0, 3, or 2 when the wrapper
 itself failed. Without `--wait` it reports the slots finished so far and exits 1 while the
-run goes on. Exit 4 means there is no run, or it was killed before it finished: read
-`review-run.log` and the slots' logs, then start it again. Act on the reviews only after `review-status` reports the run
-finished.
+run goes on. Exit 4 means there is no run, it was killed before it finished, or a later run
+into the same directory replaced it; the message says which. For a killed run, read
+`review-run.log` and the slots' logs; for a replaced one they belong to the later run. Then
+start it again. Act on the reviews only after `review-status` reports the run finished.
 
 Each slot writes `review-<n>.md`, whose first line names the reviewer, and
 `review-<n>.log`, the raw output of its runs as they happen. A reviewer that
