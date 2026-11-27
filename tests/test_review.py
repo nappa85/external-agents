@@ -812,65 +812,6 @@ class ReviewerSelectionTests(Sandbox):
             ],
         )
 
-    @unittest.skipUnless(shutil.which("node"), "needs node")
-    def test_amp_reviewer_plugin_confines_file_tools_to_the_snapshot(self) -> None:
-        # Amp drops `amp.permissions` rules, so the generated plugin's tool.call hook must
-        # decide every call. This runs that hook under node with a stand-in plugin API.
-        snap = self.root / "snapshot"
-        outside = self.root / "outside"
-        (snap / "src").mkdir(parents=True)
-        outside.mkdir()
-        (snap / "src/lib.rs").write_text("fn old() {}\n")
-        (outside / "secret.txt").write_text("secret\n")
-        (self.root / "snapshot-sibling").mkdir()
-        (snap / "link.txt").symlink_to(outside / "secret.txt")
-        (snap / "linked-dir").symlink_to(outside)
-        (snap / "dangling.txt").symlink_to(outside / "planted.txt")
-        review.Reviewer("amp", "p/model").prepare(snap)
-        plugin = self.root / "plugin.mjs"
-        shutil.copyfile(snap / ".amp/plugins/external-reviewer.ts", plugin)
-        calls = [
-            ("Read", f"{snap}/src/lib.rs", "allow"),
-            ("Read", str(snap), "allow"),
-            ("Read", f"{snap}/.amp/settings.json", "allow"),
-            ("create_file", f"{snap}/tests/new/test_bug.rs", "allow"),
-            ("edit_file", f"{snap}/src/lib.rs", "allow"),
-            ("Read", f"{outside}/secret.txt", "reject"),
-            ("Read", f"{snap}-sibling", "reject"),
-            ("Read", "src/lib.rs", "reject"),
-            ("Read", f"{snap}/src/../../outside/secret.txt", "reject"),
-            ("Read", f"{snap}/missing/../link.txt", "reject"),
-            ("Read", f"{snap}/link.txt", "reject"),
-            ("Read", f"{snap}/linked-dir/secret.txt", "reject"),
-            ("create_file", f"{snap}/linked-dir/new.txt", "reject"),
-            ("create_file", f"{snap}/dangling.txt", "reject"),
-            ("edit_file", f"{snap}/.amp/plugins/external-reviewer.ts", "reject"),
-            ("create_file", f"{snap}/.amp/settings.json", "reject"),
-            ("shell_command", f"{snap}/src/lib.rs", "reject"),
-            ("Read", None, "reject"),
-        ]
-        driver = (
-            "const handlers = {};\n"
-            "const amp = { createAgent: () => ({ definition: {} }), registerAgentMode() {},"
-            " on(name, handler) { handlers[name] = handler } };\n"
-            f"(await import({json.dumps(plugin.as_uri())})).default(amp);\n"
-            "for (const [tool, path] of JSON.parse(process.argv[1])) {\n"
-            "  const input = path === null ? {} : { path };\n"
-            "  const result = await handlers['tool.call']({ toolUseID: 't', tool, input, thread: { id: 'T' } });\n"
-            "  console.log(result.action);\n"
-            "}\n"
-        )
-        result = subprocess.run(
-            ["node", "--input-type=module", "-e", driver, json.dumps([[tool, path] for tool, path, _ in calls])],
-            capture_output=True,
-            text=True,
-        )
-
-        self.assertEqual(result.returncode, 0, result.stderr)
-        actions = [{"reject-and-continue": "reject"}.get(action, action) for action in result.stdout.split()]
-        self.assertEqual(len(actions), len(calls), result.stdout)
-        self.assertEqual([(tool, path, action) for (tool, path, _), action in zip(calls, actions, strict=True)], calls)
-
     def test_vibe_reviewer_runs_confined_without_the_repository_config(self) -> None:
         self.write(".vibe/tools/repo_tool.py", "import os\n")
         git(self.repo, "add", "-A")
@@ -940,6 +881,121 @@ class ReviewerSelectionTests(Sandbox):
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.output.read_text(), "reviewer: claude\nmistral=m\n")
+
+
+@unittest.skipUnless(shutil.which("node"), "needs node")
+class AmpPluginTests(unittest.TestCase):
+    """The generated amp reviewer plugin under node, with a stand-in plugin API. Amp drops
+    `amp.permissions` rules, so the plugin's tool.call hook must decide every call."""
+
+    def setUp(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name)
+        self.snap = snap = self.root / "snapshot"
+        self.outside = outside = self.root / "outside"
+        (snap / "src").mkdir(parents=True)
+        outside.mkdir()
+        (snap / "src/lib.rs").write_text("fn old() {}\nfn Older() {}\n")
+        (snap / "src/a.py").write_text("def old(): pass\n")
+        (snap / "blob.bin").write_bytes(b"old\0")
+        (outside / "secret.txt").write_text("TOKEN_OUTSIDE\n")
+        (self.root / "snapshot-sibling").mkdir()
+        (snap / "link.txt").symlink_to(outside / "secret.txt")
+        (snap / "linked-dir").symlink_to(outside)
+        (snap / "dangling.txt").symlink_to(outside / "planted.txt")
+        review.Reviewer("amp", "p/model").prepare(snap)
+        self.plugin = self.root / "plugin.mjs"
+        shutil.copyfile(snap / ".amp/plugins/external-reviewer.ts", self.plugin)
+
+    def run_plugin(self, operations: list[tuple[str, str, dict[str, object]]]) -> list[str]:
+        """Each operation is (`hook` or `run`, tool, input); returns the hook's action, or
+        the tool's text or `error: message`."""
+        driver = (
+            "const handlers = {}, tools = {};\n"
+            "const amp = { createAgent: () => ({ definition: {} }), registerAgentMode() {},"
+            " registerTool(tool) { tools[tool.name] = tool }, on(name, handler) { handlers[name] = handler } };\n"
+            f"(await import({json.dumps(self.plugin.as_uri())})).default(amp);\n"
+            "const results = [];\n"
+            "for (const [kind, tool, input] of JSON.parse(process.argv[1])) {\n"
+            "  if (kind === 'hook') {\n"
+            "    const result = await handlers['tool.call']({ toolUseID: 't', tool, input, thread: { id: 'T' } });\n"
+            "    results.push(result.action);\n"
+            "  } else {\n"
+            "    try { results.push(await tools[tool].execute(input, {})) }\n"
+            "    catch (error) { results.push(`error: ${error.message}`) }\n"
+            "  }\n"
+            "}\n"
+            "console.log(JSON.stringify(results));\n"
+        )
+        result = subprocess.run(
+            ["node", "--input-type=module", "-e", driver, json.dumps(operations)], capture_output=True, text=True
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return json.loads(result.stdout)
+
+    def test_the_hook_allows_only_its_tools_inside_the_snapshot(self) -> None:
+        snap, outside = self.snap, self.outside
+        calls = [
+            ("Read", f"{snap}/src/lib.rs", "allow"),
+            ("Read", str(snap), "allow"),
+            ("Read", f"{snap}/.amp/settings.json", "allow"),
+            ("create_file", f"{snap}/tests/new/test_bug.rs", "allow"),
+            ("edit_file", f"{snap}/src/lib.rs", "allow"),
+            ("search_files", None, "allow"),
+            ("find_files", f"{snap}/src", "allow"),
+            ("Read", f"{outside}/secret.txt", "reject"),
+            ("Read", f"{snap}-sibling", "reject"),
+            ("Read", "src/lib.rs", "reject"),
+            ("Read", f"{snap}/src/../../outside/secret.txt", "reject"),
+            ("Read", f"{snap}/missing/../link.txt", "reject"),
+            ("Read", f"{snap}/link.txt", "reject"),
+            ("Read", f"{snap}/linked-dir/secret.txt", "reject"),
+            ("create_file", f"{snap}/linked-dir/new.txt", "reject"),
+            ("create_file", f"{snap}/dangling.txt", "reject"),
+            ("edit_file", f"{snap}/.amp/plugins/external-reviewer.ts", "reject"),
+            ("create_file", f"{snap}/.amp/settings.json", "reject"),
+            ("search_files", f"{snap}/linked-dir", "reject"),
+            ("find_files", str(outside), "reject"),
+            ("shell_command", f"{snap}/src/lib.rs", "reject"),
+            ("Read", None, "reject"),
+        ]
+        actions = self.run_plugin([("hook", tool, {} if path is None else {"path": path}) for tool, path, _ in calls])
+        actions = [{"reject-and-continue": "reject"}.get(action, action) for action in actions]
+        self.assertEqual([(tool, path, action) for (tool, path, _), action in zip(calls, actions, strict=True)], calls)
+
+    def test_the_search_tools_stay_in_the_snapshot(self) -> None:
+        (self.snap / "many.txt").write_text("hit\n" * 250)
+        results = self.run_plugin(
+            [
+                ("run", "search_files", {"pattern": "fn old|def old"}),
+                ("run", "search_files", {"pattern": "OLD", "ignore_case": True, "glob": "**/*.rs"}),
+                ("run", "search_files", {"pattern": "TOKEN_OUTSIDE"}),
+                ("run", "search_files", {"pattern": "(", "path": f"{self.snap}/src"}),
+                ("run", "search_files", {"pattern": "TOKEN", "path": f"{self.outside}"}),
+                ("run", "find_files", {"glob": "src/*"}),
+                ("run", "find_files", {"glob": "*.txt"}),
+                ("run", "search_files", {"pattern": "hit", "path": f"{self.snap}/many.txt"}),
+            ]
+        )
+
+        invalid = results.pop(3)
+        self.assertTrue(invalid.startswith("error: Invalid pattern: "), invalid)
+        self.assertEqual(
+            results[:6],
+            [
+                "src/a.py:1: def old(): pass\nsrc/lib.rs:1: fn old() {}",
+                "src/lib.rs:1: fn old() {}\nsrc/lib.rs:2: fn Older() {}",
+                "No matches.",
+                f"error: Stay inside {self.snap.resolve()}.",
+                "src/a.py\nsrc/lib.rs",
+                "many.txt",
+            ],
+        )
+        lines = results[6].splitlines()
+        self.assertEqual(len(lines), 201)
+        self.assertEqual(lines[199], "many.txt:200: hit")
+        self.assertEqual(lines[200], "More results; narrow the search.")
 
 
 class FreeTierAndCompletenessTests(Sandbox):

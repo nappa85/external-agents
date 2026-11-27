@@ -68,6 +68,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `amp` reviewers can search: the generated mode adds `search_files` (a regular expression
+  over file contents) and `find_files` (a glob over paths), confined to the snapshot like
+  its file tools. Amp has no search tool of its own, so reviewers read whole files to find
+  a definition.
 - `EXTERNAL_AGENTS_AMP_NO_CREDITS=1` runs an `amp` reviewer only when a provider
   connection linked to the Amp account, such as a ChatGPT subscription, serves its model.
   `amp config model-providers check-access` decides before each `amp` reviewer runs; a
