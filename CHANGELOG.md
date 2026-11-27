@@ -8,6 +8,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- An `amp` agent in the bubblewrap sandbox, a coding agent or a sandboxed reviewer, received
+  every `AMP_` variable, including an Amp orb's identity variables, one of which mints
+  tokens that other services trust. Its shell could read them. In the sandbox it now
+  receives only `AMP_API_KEY` and `AMP_URL`, plus the `EXTERNAL_AGENTS_ENV_PASSTHROUGH` names.
 - The `amp` reviewer's confinement no longer relies on `amp.permissions` rules, which Amp
   removes on 2026-12-04. The generated plugin's `tool.call` hook allows only its file tools,
   on absolute paths whose real location, links resolved, is inside the snapshot. It also

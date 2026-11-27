@@ -46,13 +46,14 @@ from . import mailbox, seccomp
 from .backends import (
     CODER_CREDENTIALS,
     CODER_MODEL_REQUIRED,
+    SANDBOX_CREDENTIAL_NAMES,
     coder_command,
     coder_env,
     coder_files,
     coder_hosts,
     parse_agent,
 )
-from .common import ENV_CODER, VCS_DIRS, UsageError, credential_env, is_secret
+from .common import ENV_CODER, VCS_DIRS, UsageError, credential_env, is_secret, passthrough_names
 from .proxy import Proxy
 
 HOME = Path.home()
@@ -449,12 +450,23 @@ os.execvp(sys.argv[2], sys.argv[2:])
 """
 
 
+def sandbox_credentials(backend: str, model: str | None) -> dict[str, str]:
+    """The credential variables an agent receives in the sandbox; the passthrough names
+    always pass."""
+    found = credential_env(backend, model)
+    allowed = SANDBOX_CREDENTIAL_NAMES.get(backend)
+    if allowed is None:
+        return found
+    passthrough = passthrough_names()
+    return {name: value for name, value in found.items() if name in allowed or name in passthrough}
+
+
 def bind_agent(backend: str, model: str | None, mounts: Mounts) -> str:
     """Bind an agent CLI, its login files and its credential variables; return the CLI's
     real path."""
     executable = bind_executable(backend, mounts)
     mounts.credentials = [rel for rel in CODER_CREDENTIALS[backend] if (HOME / rel).is_file()]
-    mounts.env |= credential_env(backend, model) | coder_env(backend)
+    mounts.env |= sandbox_credentials(backend, model) | coder_env(backend)
     return executable
 
 
@@ -576,7 +588,7 @@ def code(args: argparse.Namespace, command: list[str] | None) -> int:
         assert backend is not None
         if not hosts and args.hosts is None:
             fail(f"no egress host is known for {spec}; name the provider's API host with --allow-host")
-        if not mounts.credentials and not credential_env(backend, model):
+        if not mounts.credentials and not sandbox_credentials(backend, model):
             print(f"warning: {backend} has no login file or credential variable; it may fail", file=sys.stderr)
         task = args.task.read_text()
         if not args.raw_task:

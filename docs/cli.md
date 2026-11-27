@@ -25,7 +25,9 @@ settings) and the backend's own provider credentials: `ANTHROPIC_*` and `CLAUDE_
 the `AWS_*`, `GOOGLE_*`, `VERTEX_*`, `CLOUD_ML_*` and `AZURE_*` platforms that serve Claude;
 `OPENAI_*`, `CODEX_*` and `AZURE_*` for codex; `AMP_*` for amp; `MISTRAL_*` for vibe; and for
 opencode `OPENCODE_*` plus the prefixes of the model's provider, such as `OPENAI_*` for
-`openai/...`. No agent receives another provider's keys.
+`openai/...`. No agent receives another provider's keys. In the bubblewrap sandbox, where an
+agent has a shell, amp receives only `AMP_API_KEY` and `AMP_URL`, not an Amp orb's identity
+variables.
 
 ## Backends and models
 
