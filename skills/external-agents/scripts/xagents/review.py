@@ -835,8 +835,8 @@ def output_paths(args: argparse.Namespace, count: int) -> list[Path]:
             )
         if stem.endswith((".run", ".status")):
             raise UsageError(
-                f"--output {args.output}: the wrapper writes <stem>.run.log and <stem>.status.json for other "
-                "outputs; pick a stem that does not end in .run or .status"
+                f"--output {args.output}: stems ending in .run or .status are reserved, since <stem>.run.log is "
+                "the run log of another output; pick a stem that does not end in .run or .status"
             )
         if not args.output.parent.is_dir():
             raise UsageError(f"cannot use --output {args.output}: {args.output.parent} is not a directory")

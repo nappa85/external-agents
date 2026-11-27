@@ -179,9 +179,10 @@ shell's `&`: `--background` returns only once the run has recorded its status, a
 `--background` starts the run detached, writes its own output to `review-run.log` in the
 output directory (`<name>.run.log` next to `--output`), and returns 0 as soon as the run has
 recorded its status. When the run fails to start, such as on a usage error, it returns the
-run's exit code instead. When the run already ended and a later run into the same outputs
-replaced its status, it says so with the run's exit code and returns 0: that exit code is
-the outcome, and `review-status` would describe the later run.
+run's exit code instead. When the run already ended and its status is gone, replaced or
+removed, it says so with the run's exit code and returns 0: the printed exit code is the
+outcome, a later run may have replaced the reviews, and `review-status` would describe that
+later run, so start the review again. A fresh `--output-dir` per review avoids this.
 Any run, in the background or not, records its progress in `review-status.json`
 (`<name>.status.json`): each slot's reviewer chain, and its outcome as soon as the slot
 ends.

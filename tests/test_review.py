@@ -969,7 +969,8 @@ class ReviewStatusTests(Sandbox):
         super().setUp()
         self.out = self.root / "out"
         self.release = self.root / "release"
-        self.addCleanup(self.release.touch)
+        # Runs before the temporary directory is removed: cleanups run last first.
+        self.addCleanup(self.finish_background_runs)
         self.fake(
             "amp",
             "if grep -q 'model: \"p/slow\"' .amp/plugins/external-reviewer.ts; then\n"
@@ -978,6 +979,15 @@ class ReviewStatusTests(Sandbox):
         )
         self.fake("opencode", 'echo "Error: model not found"; exit 1')
         self.env = {"RELEASE": str(self.release), "EXTERNAL_AGENTS_ENV_PASSTHROUGH": "RELEASE"}
+
+    def finish_background_runs(self) -> None:
+        """Let a slow run end and wait for it, so it is not writing while its files go."""
+        self.release.touch()
+        for lock in [self.out / "review-1.log", *self.out.glob(".review-status.json.*.lock")]:
+            for _ in range(300):
+                if not review.status.alive(lock):
+                    break
+                time.sleep(0.1)
 
     def start(self, panel: str) -> subprocess.CompletedProcess[str]:
         return self.run_script(
@@ -1367,6 +1377,13 @@ class ReviewStatusTests(Sandbox):
                 result = self.review(env={"EXTERNAL_REVIEWERS": "amp:p/fast"})
 
                 self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                stem = name.rsplit(".", 1)[0].lower()
+                if name.lower().endswith((".log", ".patch", ".status.json")):
+                    self.assertIn("the wrapper writes files with that ending", result.stderr)
+                elif stem.endswith((".run", ".status")):
+                    self.assertIn("stems ending in .run or .status are reserved", result.stderr)
+                else:
+                    self.assertIn("--output-dir's files", result.stderr)
 
     def test_the_hidden_run_option_leaves_short_prefixes_unambiguous(self) -> None:
         self.release.touch()

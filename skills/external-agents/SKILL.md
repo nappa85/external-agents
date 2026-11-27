@@ -86,8 +86,10 @@ a later run into the same directory is never taken for it:
 /usr/bin/python3 -I <skill-dir>/scripts/external_agents.py review-status --wait --output-dir /abs/path/out --run 83eb06...
 ```
 
-If `--background` instead says the run already ended, its exit code is the outcome: a later
-run may have replaced the reviews, so start the review again.
+If `--background` instead says the run already ended, the exit code it prints is the
+outcome (`--background` itself exits 0): a later run may have replaced the reviews, so start
+the review again. Give each review its own `--output-dir`, so no later run can replace its
+files before you read them.
 
 It prints one line per slot, `written by <reviewer> to <file>` or `missing, no reviewer
 available (<why>)`, and exits with the run's own exit code: 0, 3, or 2 when the wrapper
