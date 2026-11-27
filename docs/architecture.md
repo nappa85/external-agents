@@ -10,6 +10,7 @@ skills/external-agents/scripts/
     backends.py        per-backend facts: installers, commands, egress, login files
     snapshot.py        sanitized snapshots, diff filtering, change recording
     review.py          panels, preflight, fallback, free-tier ledger
+    status.py          review status file, background runs, review-status
     sandbox.py         bubblewrap arguments, binding agent installations, the run
     proxy.py           HTTPS CONNECT proxy with host and TLS-name checks
     mailbox.py         question and answer sockets
@@ -61,6 +62,10 @@ skills/external-agents/scripts/
    system configuration, no hooks; its config and attributes are rewritten before every
    git command, and attributes that would convert content are unset). The diff, minus handoff files, generated configuration,
    and secret-like files, becomes `review-<n>.patch`.
+8. **Status.** The run writes `review-status.json` atomically when it starts, when each
+   slot ends, and when it ends, and holds an `flock` on its first slot's log meanwhile.
+   `review-status` reads the file; a file that is not finished while nobody holds the lock
+   is a run that was killed. Status files and run logs stay out of the snapshot.
 
 ## Coding sandbox
 

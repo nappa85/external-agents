@@ -5,11 +5,13 @@ reviewers or as sandboxed coding agents.
   detect                       what is configured, installed, and missing
   install [targets]            install pinned CLIs and bubblewrap (default: what is configured)
   review                       run the reviewer panel on a sanitized snapshot
+  review-status                a review run's outcome per slot; --wait blocks until it ends
   code                         run a coding agent in bubblewrap on a git worktree
   question / answer            the coding agent's questions, over a Unix socket
 
 Exit codes: 0 success; 2 usage or setup error; 3 (review) a required reviewer slot had no
-available reviewer; the coding agent's own exit code, or 124 on timeout, for `code`;
+available reviewer; for `review-status`, the run's exit code once it finished, 1 while it
+runs, 4 when there is no run or it ended without finishing; the coding agent's own exit code, or 124 on timeout, for `code`;
 1 (question) none waiting; 4 (question, answer) no active run.
 """
 
@@ -27,7 +29,7 @@ from pathlib import Path
 # directory off sys.path.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from xagents import mailbox, review, sandbox  # noqa: E402
+from xagents import mailbox, review, sandbox, status  # noqa: E402
 from xagents.backends import BACKENDS, CODER_MODEL_REQUIRED, INSTALLERS, parse_agent  # noqa: E402
 from xagents.common import ENV_CODER, ENV_REVIEWERS, UsageError, installed  # noqa: E402
 
@@ -103,6 +105,7 @@ def parser() -> argparse.ArgumentParser:
     setup.add_argument("targets", nargs="*", help=f"{', '.join(INSTALLERS)}, or all; default: what is configured")
     setup.add_argument("--best-effort", action="store_true", help="Exit 0 even when an install fails")
     review.add_parser(commands)
+    status.add_parser(commands)
     sandbox.add_parsers(commands)
     return root
 
@@ -121,8 +124,13 @@ def main(argv: list[str]) -> int:
             return detect(args)
         if args.command == "install":
             return install(args)
+        # The detached run gets the same arguments, so it must not detach again.
+        if args.command == "review" and args.background and os.environ.get(status.ENV_DETACHED) != "1":
+            return status.background(Path(__file__).resolve(), argv, args.output, args.output_dir)
         if args.command == "review":
             return review.review(args)
+        if args.command == "review-status":
+            return status.review_status(args)
         if args.command == "code":
             return sandbox.code(args, command or None)
         if args.command == "question":

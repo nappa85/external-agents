@@ -955,6 +955,179 @@ class ReviewerSelectionTests(Sandbox):
 
 
 @unittest.skipUnless(shutil.which("node"), "needs node")
+class ReviewStatusTests(Sandbox):
+    """`review --background` and `review-status`, on a panel whose second slot runs until
+    the test releases it."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.out = self.root / "out"
+        self.release = self.root / "release"
+        self.addCleanup(self.release.touch)
+        self.fake(
+            "amp",
+            "if grep -q 'model: \"p/slow\"' .amp/plugins/external-reviewer.ts; then\n"
+            '  i=0; while [ ! -e "$RELEASE" ] && [ $i -lt 300 ]; do sleep 0.1; i=$((i + 1)); done\n'
+            "fi\necho amp review",
+        )
+        self.fake("opencode", 'echo "Error: model not found"; exit 1')
+        self.env = {"RELEASE": str(self.release), "EXTERNAL_AGENTS_ENV_PASSTHROUGH": "RELEASE"}
+
+    def start(self, panel: str) -> subprocess.CompletedProcess[str]:
+        return self.run_script(
+            "review", "--prompt-file", str(self.prompt), "--output-dir", str(self.out), "--no-preflight",
+            "--reviewers", panel, "--background", env=self.env,
+        )  # fmt: skip
+
+    def status(self, *args: str) -> subprocess.CompletedProcess[str]:
+        return self.run_script("review-status", "--output-dir", str(self.out), *args)
+
+    def wait_for(self, text: str) -> subprocess.CompletedProcess[str]:
+        for _ in range(100):
+            result = self.status()
+            if text in result.stdout:
+                return result
+            time.sleep(0.1)
+        self.fail(f"never saw {text!r}: {result.stdout}{result.stderr}")
+
+    def test_status_reports_each_slot_as_it_finishes_and_wait_blocks_until_the_end(self) -> None:
+        started = self.start("amp:p/fast; amp:p/slow; ? opencode:p/m")
+        self.assertEqual(started.returncode, 0, started.stdout + started.stderr)
+        self.assertIn("review-status --wait --output-dir", started.stdout)
+
+        running = self.wait_for("optional slot 3: missing")
+        self.assertEqual(running.returncode, 1, running.stderr)
+        self.assertIn(f"slot 1: written by amp:p/fast to {self.out / 'review-1.md'}", running.stdout)
+        self.assertIn("slot 2: running (amp:p/slow)", running.stdout)
+        self.assertIn(
+            "optional slot 3: missing, no reviewer available (opencode:p/m: unavailable (exit 1))", running.stdout
+        )
+        timed_out = self.status("--wait", "--timeout", "0.5")
+        self.assertEqual(timed_out.returncode, 1, timed_out.stderr)
+
+        self.release.touch()
+        done = self.status("--wait", "--timeout", "30")
+
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        self.assertTrue(done.stdout.startswith("review finished at "), done.stdout)
+        self.assertIn(", exit 0\n", done.stdout)
+        self.assertIn("slot 2: written by amp:p/slow", done.stdout)
+        self.assertEqual((self.out / "review-2.md").read_text(), "reviewer: amp:p/slow\namp review\n")
+        status = json.loads((self.out / "review-status.json").read_text())
+        self.assertEqual([slot["state"] for slot in status["slots"]], ["written", "written", "missing"])
+
+    def test_wait_returns_the_runs_exit_code_when_a_required_slot_is_missing(self) -> None:
+        self.release.touch()
+        self.assertEqual(self.start("amp:p/fast; opencode:p/m").returncode, 0)
+
+        done = self.status("--wait", "--timeout", "30")
+
+        self.assertEqual(done.returncode, 3, done.stdout + done.stderr)
+        self.assertIn("slot 2: missing, no reviewer available (opencode:p/m: unavailable (exit 1))", done.stdout)
+
+    def test_a_killed_run_is_reported_as_ended_without_finishing(self) -> None:
+        self.assertEqual(self.start("amp:p/slow").returncode, 0)
+        pid = json.loads((self.out / "review-status.json").read_text())["pid"]
+
+        os.killpg(pid, 9)
+        ended = self.status("--wait", "--timeout", "30")
+
+        self.assertEqual(ended.returncode, 4, ended.stdout + ended.stderr)
+        self.assertIn("review ended without finishing", ended.stdout)
+        self.assertIn("slot 1: never finished", ended.stdout)
+
+    def test_a_second_run_into_the_same_outputs_is_refused_while_one_runs(self) -> None:
+        self.assertEqual(self.start("amp:p/slow").returncode, 0)
+
+        for second in (self.start("amp:p/fast"), self.run_script(
+            "review", "--prompt-file", str(self.prompt), "--output-dir", str(self.out), "--no-preflight",
+            "--reviewers", "amp:p/fast", env=self.env,
+        )):  # fmt: skip
+            self.assertEqual(second.returncode, 2, second.stdout + second.stderr)
+            self.assertIn("a review is already running with these outputs", second.stderr)
+        self.assertEqual(self.status().returncode, 1)
+
+    def test_without_a_run_status_exits_4(self) -> None:
+        result = self.status("--wait")
+
+        self.assertEqual(result.returncode, 4, result.stdout + result.stderr)
+        self.assertIn("no review run found", result.stderr)
+
+    def test_a_background_run_that_fails_to_start_reports_its_error(self) -> None:
+        result = self.run_script(
+            "review", "--prompt-file", str(self.root / "missing.md"), "--output-dir", str(self.out),
+            "--reviewers", "amp:p/fast", "--background",
+        )  # fmt: skip
+
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn("prompt file", result.stderr)
+
+    def test_an_abbreviated_background_flag_detaches_once(self) -> None:
+        self.release.touch()
+        started = self.run_script(
+            "review", "--prompt-file", str(self.prompt), "--output-dir", str(self.out), "--no-preflight",
+            "--reviewers", "amp:p/fast", "--back", env=self.env,
+        )  # fmt: skip
+        self.assertEqual(started.returncode, 0, started.stdout + started.stderr)
+
+        done = self.status("--wait", "--timeout", "30")
+
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        self.assertIn("slot 1: written by amp:p/fast", done.stdout)
+        self.assertNotIn("review running in the background", (self.out / "review-run.log").read_text())
+
+    def test_a_bad_base_is_a_usage_error_and_records_no_run(self) -> None:
+        result = self.run_script(
+            "review", "--prompt-file", str(self.prompt), "--output-dir", str(self.out), "--no-preflight",
+            "--reviewers", "amp:p/fast", "--base", "no-such-revision", "--background", env=self.env,
+        )  # fmt: skip
+
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertFalse((self.out / "review-status.json").exists())
+        self.assertEqual(self.status().returncode, 4)
+
+    def test_a_finished_run_never_shows_a_slot_as_running(self) -> None:
+        self.out.mkdir()
+        slot = {"slot": 1, "optional": False, "chain": ["amp:p/fast"], "state": "running", "log": "review-1.log"}
+        (self.out / "review-status.json").write_text(
+            json.dumps({"state": "finished", "finished": "now", "exit": 2, "slots": [slot]})
+        )
+
+        result = self.status()
+
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn("slot 1: never finished", result.stdout)
+        self.assertNotIn("running", result.stdout)
+
+    def test_status_files_inside_the_checkout_stay_out_of_the_next_review(self) -> None:
+        self.release.touch()
+        self.out = self.repo / "reviews"
+        self.out.mkdir()
+        # Left by an earlier run, including a temporary copy of the status file.
+        for name in ("review-status.json", "review-run.log", ".review-status.json.abc123"):
+            (self.out / name).write_text("{}\n")
+        self.fake(
+            "amp",
+            "if ls -a reviews 2>/dev/null | grep -q .; then ls -a reviews; exit 1; fi; "
+            "! grep -qF review-status REVIEW_FILES.txt && echo independent review",
+        )
+
+        self.assertEqual(self.start("amp:p/fast").returncode, 0)
+        done = self.status("--wait", "--timeout", "30")
+
+        self.assertEqual(done.returncode, 0, done.stdout + (self.out / "review-1.md").read_text())
+
+    def test_a_foreground_run_with_output_records_its_status_next_to_it(self) -> None:
+        self.release.touch()
+        result = self.review(env={"EXTERNAL_REVIEWERS": "amp:p/fast"})
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+        done = self.run_script("review-status", "--output", str(self.output), "--wait")
+
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        self.assertIn(f"slot 1: written by amp:p/fast to {self.output}", done.stdout)
+
+
 class AmpPluginTests(unittest.TestCase):
     """The generated amp reviewer plugin under node, with a stand-in plugin API. Amp drops
     `amp.permissions` rules, so the plugin's tool.call hook must decide every call."""

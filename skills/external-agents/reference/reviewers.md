@@ -161,14 +161,45 @@ python3 -I <skill-dir>/scripts/external_agents.py review \
   output that does not match counts as incomplete: the next reviewer is tried, and the
   incomplete output is kept in the slot's file when none succeeds.
 
-Run it in the background next to your own subagent. Slots run in parallel, so a panel
-takes about as long as its slowest slot; a review can take several minutes.
+Slots run in parallel, so a panel takes about as long as its slowest slot; a review can
+take several minutes. Start it with `--background` next to your own subagent, not with a
+shell's `&`: `--background` returns only once the run has replaced any earlier run's
+status, so `review-status` never reports the previous run.
+
+`review` exits:
 
 | Exit | Meaning                                                                         |
 | ---- | ------------------------------------------------------------------------------- |
 | 0    | every required slot wrote a review                                              |
 | 3    | a required slot, or every slot, had no available reviewer; its file says why    |
-| 2    | usage or setup error                                                            |
+| 2    | usage or setup error, or another run is writing to the same outputs             |
+
+### Follow a run
+
+`--background` starts the run detached, writes its own output to `review-run.log` in the
+output directory (`<name>.run.log` next to `--output`), and returns as soon as the run is
+under way, or with the run's exit code when it fails to start, such as on a usage error.
+Any run, in the background or not, records its progress in `review-status.json`
+(`<name>.status.json`): each slot's reviewer chain, and its outcome as soon as the slot
+ends.
+
+```bash
+python3 -I <skill-dir>/scripts/external_agents.py review-status --wait --output-dir "$OUT_DIR"
+```
+
+`review-status` reads that file and prints the run, then one line per slot: `written by
+<reviewer> to <file>`, with the patch when there is one, `missing, no reviewer available
+(<why>)`, or `running (<chain>)` with its log. `--wait` blocks until the run ends;
+`--timeout <s>` bounds the wait. Pass the same `--output-dir` or `--output` as the run.
+
+| Exit   | Meaning                                                                     |
+| ------ | --------------------------------------------------------------------------- |
+| 0, 3   | the run finished; the run's own exit code (2 if the wrapper itself failed) |
+| 1      | still running (without `--wait`, or when `--timeout` expired)               |
+| 4      | no run in this output directory, or it was killed before it finished        |
+
+The run holds a lock on its first slot's log while it runs, which tells a running run
+from a killed one, and refuses a second run into the same outputs (exit 2).
 
 A reviewer may add or change files in its snapshot. The wrapper returns them as
 `review-<n>.patch`, which applies to the reviewed checkout with `git apply`; it leaves

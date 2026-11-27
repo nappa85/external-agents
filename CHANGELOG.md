@@ -72,6 +72,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `review --background` and `review-status`. Nothing told a coordinator that ran a review in
+  the background when it ended. `--background` starts the run detached and returns once it
+  is under way; every run records each slot's outcome in `review-status.json` as the slot
+  ends; `review-status --wait` blocks until the run ends, prints each slot's reviewer or
+  why it has none, and exits with the run's exit code, or 4 when the run was killed.
+  A second run into the same outputs is refused.
 - `EXTERNAL_AGENTS_REVIEW_SANDBOX=1` runs reviewers in the bubblewrap sandbox that `code`
   uses, with a shell, so they can search and run the tests; `codex` is confined there too.
   Without a working bwrap they keep file tools only.
