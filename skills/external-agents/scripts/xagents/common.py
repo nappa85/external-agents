@@ -24,6 +24,8 @@ ENV_CODER = "EXTERNAL_CODER"
 # Extra variables, comma-separated, that an agent process receives, such as a provider key
 # with an unusual name.
 ENV_PASSTHROUGH = "EXTERNAL_AGENTS_ENV_PASSTHROUGH"
+# `1` runs reviewers in the coding sandbox, with a shell, where bubblewrap works.
+ENV_REVIEW_SANDBOX = "EXTERNAL_AGENTS_REVIEW_SANDBOX"
 # `1` runs an `amp` reviewer only when a provider connection linked to the Amp account
 # serves its model, never on Amp credits.
 ENV_AMP_NO_CREDITS = "EXTERNAL_AGENTS_AMP_NO_CREDITS"
@@ -201,6 +203,7 @@ def run_with_timeouts(
     env: dict[str, str],
     log: Path | None = None,
     on_idle: Callable[[str, float], bool] | None = None,
+    pass_fds: tuple[int, ...] = (),
 ) -> tuple[int, str]:
     """Kill the run if it exceeds `total` seconds or, when `idle` is set, is silent that long.
 
@@ -209,7 +212,8 @@ def run_with_timeouts(
     CLI whose progress shows elsewhere; it must return within those seconds.
     Returns the exit code (124 on a timeout) and the combined output without ANSI escapes.
     The raw output is also appended to `log` as it arrives, so a run that is killed
-    leaves a record of what it was doing."""
+    leaves a record of what it was doing. The CLI inherits `pass_fds`, such as the
+    sandbox's seccomp filter."""
     sink = open(log, "ab") if log is not None else None  # noqa: SIM115 - closed in finally
     try:
         # A new session lets a timeout kill the CLI's child processes too, which would
@@ -222,6 +226,7 @@ def run_with_timeouts(
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             start_new_session=True,
+            pass_fds=pass_fds,
         )
     except BaseException:
         if sink is not None:

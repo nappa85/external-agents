@@ -52,6 +52,18 @@ reviewer that follows instructions injected into the reviewed code:
 - `codex --sandbox workspace-write` limits writes to the snapshot and blocks network,
   but its shell can still read files elsewhere on the host.
 
+### Sandboxed reviewers
+
+With `EXTERNAL_AGENTS_REVIEW_SANDBOX=1`, each reviewer runs inside the bubblewrap sandbox
+that `code` uses, on its snapshot, and gets a shell: it can search with `rg` and run the
+tests to confirm a finding. The sandbox sees the snapshot, the CLI and its login file, and
+reaches only the model provider. The wrapper's generated configuration stays read-only,
+and `codex` drops its own sandbox, which cannot start inside bubblewrap. Without a working
+bwrap (macOS, or a Linux host that refuses user namespaces) reviewers keep the file tools
+above. An `amp` reviewer also keeps them when there is no `AMP_API_KEY` or amp login file,
+since it could not sign in inside the sandbox. Files the repository ignores that a run
+creates, such as test caches, are left out of the returned patch.
+
 Project configuration in the snapshot that a backend would load and that can run code
 is not used: `claude` loads only user settings, and the wrapper removes `.codex/` for
 `codex`, `.opencode/` and `opencode.jsonc` for `opencode`, `.amp/plugins/` for `amp`,

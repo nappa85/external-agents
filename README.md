@@ -10,7 +10,8 @@ a skill and run a shell command) to use *other* agent CLIs in two roles:
   models catch different bugs. Reviewers work on a throwaway copy of your repository with
   secrets stripped out and can only read and write files there. A `codex` reviewer is the
   exception: its shell can still read files elsewhere on the host, so use it only on code
-  you trust.
+  you trust. With `EXTERNAL_AGENTS_REVIEW_SANDBOX=1` on Linux, reviewers run in the coding
+  sandbox instead, with a shell to search and run tests, and `codex` is confined too.
 - 🛠️ **Coding agents.** Hand a task to another agent and let it work in a git worktree
   inside a [bubblewrap](https://github.com/containers/bubblewrap) sandbox. It can't see
   the rest of your home directory, can't reach the network except its own model API, and

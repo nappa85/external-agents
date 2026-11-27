@@ -39,7 +39,11 @@ skills/external-agents/scripts/
    write to `.amp/`; `vibe` with
    the `accept-edits` policy, `outside_workdir = "deny"`, shell, web and subagent tools
    set to `never`, and those settings passed as `VIBE_*` variables, which override the
-   user's config; `codex exec --sandbox workspace-write`.
+   user's config; `codex exec --sandbox workspace-write`. With
+   `EXTERNAL_AGENTS_REVIEW_SANDBOX=1` and a working bwrap, the CLI instead runs inside the
+   `code` sandbox (`sandbox.launch`, without the mailbox) on the snapshot, with its shell
+   allowed and the generated configuration bound read-only. The handoff diff carries
+   whole changed functions (`--function-context`).
 4. **Run.** The CLI runs in its own session with an allowlisted environment. A total
    deadline and an idle deadline (for CLIs that stream output) kill the whole process
    group. Output is read in raw chunks, so a run that prints without a newline or closes

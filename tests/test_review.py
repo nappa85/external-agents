@@ -12,7 +12,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from support import SCRIPT, common, review, snapshot
+from support import SCRIPT, common, review, sandbox, snapshot
 from xagents.backends import INSTALLERS
 
 
@@ -487,13 +487,32 @@ class ReviewerSelectionTests(Sandbox):
         self.assertEqual((self.root / "out/review-1.md").read_text(), "reviewer: claude:sonnet\nclaude review\n")
         self.assertIn("slot 2: no reviewer available", result.stderr)
 
+    def test_the_handoff_diff_shows_whole_changed_functions(self) -> None:
+        body = [f"    let v{n} = {n};" for n in range(1, 11)]
+        self.write("src/long.rs", "\n".join(["fn first() {}", "", "fn long() {", *body, "}", "", "fn last() {}", ""]))
+        git(self.repo, "add", "-A")
+        git(self.repo, "commit", "-q", "-m", "long")
+        self.write("src/long.rs", (self.repo / "src/long.rs").read_text().replace("let v9 = 9;", "let v9 = 90;"))
+        self.fake("claude", "cat REVIEW_DIFF.patch")
+
+        result = self.review("--base", "HEAD")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        diff = self.output.read_text()
+        self.assertIn("\n fn long() {\n     let v1 = 1;\n", diff)
+        self.assertIn("+    let v9 = 90;\n", diff)
+        self.assertNotIn("\n fn first", diff)
+        self.assertNotIn("fn last", diff)
+
     def test_reviewer_changes_are_returned_as_a_patch_that_applies_to_the_checkout(self) -> None:
         self.write("src/old.rs", "fn old() {}\n")
         self.write("snapshot/nested.rs", "fn nested() {}\n")
         self.write("crlf.txt", "a\r\nb\r\n")
         self.write(".gitattributes", "crlf.txt -text\n")
+        self.write(".gitignore", ".agents/plans/\nbuild/\n")
         git(self.repo, "add", "-A")
         git(self.repo, "commit", "-q", "-m", "old")
+        self.write(".agents/plans/plan.md", "step 1\n")
         # The second reviewer must start from the reviewed tree, without the failed first one's change.
         self.fake("codex", "echo 'fn stale() {}' > src/stale.rs; exit 1")
         self.fake(
@@ -502,10 +521,12 @@ class ReviewerSelectionTests(Sandbox):
             "echo 'fn fixed() {}' > src/lib.rs; rm src/old.rs; echo 'fn moved() {}' > snapshot/nested.rs; "
             "printf 'a\\r\\nc\\r\\n' > crlf.txt; rm REVIEW_PROMPT.md; echo '{}' > opencode.json; "
             "echo 'run()' > .opencode/plugin.ts; echo TOKEN=x > .env; test -e src/stale.rs && echo stale; "
-            "echo 'crlf.txt text' > .gitattributes; git init -q fixture; echo data > fixture/data.txt; echo review",
+            "echo 'crlf.txt text' > .gitattributes; git init -q fixture; echo data > fixture/data.txt; "
+            # Build output the repository ignores is not a proposal; an included file is.
+            "mkdir build; echo obj > build/out.o; echo 'step 2' >> .agents/plans/plan.md; echo review",
         )
 
-        result = self.review(env={"EXTERNAL_REVIEWERS": "codex | opencode:p/m"})
+        result = self.review("--include", ".agents/plans/plan.md", env={"EXTERNAL_REVIEWERS": "codex | opencode:p/m"})
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.output.read_text(), "reviewer: opencode:p/m\nreview\n\nproposed changes: review.patch\n")
@@ -525,6 +546,8 @@ class ReviewerSelectionTests(Sandbox):
         self.assertEqual((self.repo / "tests/regression.rs").read_text(), "fn regression() {}\n")
         self.assertEqual((self.repo / "snapshot/nested.rs").read_text(), "fn moved() {}\n")
         self.assertEqual((self.repo / "crlf.txt").read_bytes(), b"a\r\nc\r\n")
+        self.assertEqual((self.repo / ".agents/plans/plan.md").read_text(), "step 1\nstep 2\n")
+        self.assertFalse((self.repo / "build").exists())
 
     def test_preflight_is_not_passed_by_a_cli_that_only_echoes_its_prompt(self) -> None:
         # Like `codex exec`, which prints the user turn: it exits 0 without answering.
@@ -812,6 +835,48 @@ class ReviewerSelectionTests(Sandbox):
             ],
         )
 
+    @unittest.skipIf(sandbox.unavailable(), "needs a working bubblewrap sandbox")
+    def test_a_sandboxed_reviewer_has_a_shell_but_nothing_outside_its_snapshot(self) -> None:
+        (self.tools / "bwrap").symlink_to(shutil.which("bwrap"))
+        for tool in ("tr", "cat"):
+            if not (self.tools / tool).exists():
+                (self.tools / tool).symlink_to(shutil.which(tool))
+        outside = self.root / "outside.txt"
+        outside.write_text("OUTSIDE\n")
+        self.fake(
+            "amp",
+            f"cat {outside} 2>/dev/null || echo outside=hidden\n"
+            "(echo planted > .amp/plugins/external-reviewer.ts) 2>/dev/null && echo plugin=writable || echo plugin=read-only\n"
+            'echo "fn added() {}" > src/added.rs && echo write=ok\n'
+            'echo "github=${GITHUB_TOKEN:-unset} amp=${AMP_API_KEY:-unset}"',
+        )
+        env = {"AMP_API_KEY": "amp", "GITHUB_TOKEN": "gh"}
+
+        unconfined = self.review("--reviewer", "amp:p/model", env=env)
+        unconfined_output = self.output.read_text()
+        confined = self.review("--reviewer", "amp:p/model", env=env | {"EXTERNAL_AGENTS_REVIEW_SANDBOX": "1"})
+
+        # The control: without the sandbox the same CLI reads the file and rewrites the plugin.
+        self.assertEqual(unconfined.returncode, 0, unconfined.stderr)
+        self.assertIn("OUTSIDE", unconfined_output)
+        self.assertIn("plugin=writable", unconfined_output)
+        self.assertEqual(confined.returncode, 0, confined.stderr)
+        lines = self.output.read_text().splitlines()
+        self.assertEqual(
+            lines[:5],
+            ["reviewer: amp:p/model", "outside=hidden", "plugin=read-only", "write=ok", "github=unset amp=amp"],
+        )
+        self.assertIn("+fn added() {}", self.output.with_suffix(".patch").read_text())
+        self.assertEqual(outside.read_text(), "OUTSIDE\n")
+
+        # Without a key or login file amp would wait for a device login in the sandbox.
+        (self.root / "home").mkdir()
+        no_login = {"GITHUB_TOKEN": "gh", "HOME": str(self.root / "home"), "EXTERNAL_AGENTS_REVIEW_SANDBOX": "1"}
+        result = self.review("--reviewer", "amp:p/model", env=no_login)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("amp:p/model: no AMP_API_KEY or amp login file", result.stderr)
+        self.assertIn("plugin=writable", self.output.read_text())
+
     def test_vibe_reviewer_runs_confined_without_the_repository_config(self) -> None:
         self.write(".vibe/tools/repo_tool.py", "import os\n")
         git(self.repo, "add", "-A")
@@ -963,6 +1028,17 @@ class AmpPluginTests(unittest.TestCase):
         actions = self.run_plugin([("hook", tool, {} if path is None else {"path": path}) for tool, path, _ in calls])
         actions = [{"reject-and-continue": "reject"}.get(action, action) for action in actions]
         self.assertEqual([(tool, path, action) for (tool, path, _), action in zip(calls, actions, strict=True)], calls)
+
+    def test_in_the_sandbox_the_hook_also_allows_the_shell(self) -> None:
+        review.Reviewer("amp", "p/model", sandboxed=True).prepare(self.snap)
+        shutil.copyfile(self.snap / ".amp/plugins/external-reviewer.ts", self.plugin)
+        operations = [
+            ("hook", "shell_command", {"command": "pytest"}),
+            ("hook", "shell_command_status", {"pid": 1}),
+            ("hook", "Read", {"path": f"{self.outside}/secret.txt"}),
+            ("hook", "web_search", {"query": "x"}),
+        ]
+        self.assertEqual(self.run_plugin(operations), ["allow", "allow", "reject-and-continue", "reject-and-continue"])
 
     def test_the_search_tools_stay_in_the_snapshot(self) -> None:
         (self.snap / "many.txt").write_text("hit\n" * 250)

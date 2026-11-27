@@ -303,7 +303,8 @@ def base_diff(source: Path, base: str, exclude: Iterable[Path] = ()) -> str:
         if untracked:
             names = "\0".join(f":(literal){entry}" for entry in untracked).encode(errors="surrogateescape")
             git(source, "add", "--intent-to-add", "--pathspec-from-file=-", "--pathspec-file-nul", stdin=names, env=env)
-        return git(source, "diff", *DIFF_OPTIONS, base, "--", ".", *pathspecs, env=env)
+        # Whole changed functions, so a reviewer opens fewer files to read the code around a change.
+        return git(source, "diff", *DIFF_OPTIONS, "--function-context", base, "--", ".", *pathspecs, env=env)
 
 
 # Unset every attribute that converts content between the work tree and Git.
@@ -332,6 +333,9 @@ class Changes:
         }
         self.work_tree = work_tree
         self.owned = owned
+        # Paths in the first recorded tree: an ignored file among them, such as an included
+        # plan, is the reviewer's to change; one created later is build output.
+        self.baseline: set[bytes] | None = None
         self.run("init", "-q")
         self.config = (git_dir / "config").read_text()
 
@@ -372,6 +376,12 @@ class Changes:
         self.git("add", "--all", "--force", "--", ".")
         entries = [entry for entry in self.git("ls-files", "-z").split(b"\0") if entry]
         owned = [entry for entry in entries if self.is_owned(Path(os.fsdecode(entry)))]
+        if self.baseline is None:
+            self.baseline = set(entries)
+        else:
+            # Files the tree's own ignore rules match, such as test caches and build output.
+            listing = self.git("ls-files", "-z", "--cached", "--ignored", "--exclude-standard")
+            owned += [entry for entry in listing.split(b"\0") if entry and entry not in self.baseline]
         if owned:
             self.git("update-index", "--force-remove", "-z", "--stdin", stdin=b"\0".join(owned) + b"\0")
         return self.git("write-tree").decode().strip()

@@ -29,6 +29,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import datetime as dt
+import functools
 import json
 import os
 import platform
@@ -126,6 +127,8 @@ class Mounts:
     path: list[str] = field(default_factory=list)
     env: dict[str, str] = field(default_factory=dict)
     rw: list[tuple[str, str]] = field(default_factory=list)
+    # Paths inside the worktree that stay read-only, such as an agent's generated config.
+    protected: list[str] = field(default_factory=list)
 
     def add_ro(self, path: str) -> None:
         if not is_system(path) and path not in self.ro:
@@ -357,6 +360,8 @@ def bwrap_args(
         args += ["--ro-bind", str(run / "empty"), str(path)]
     for path in vcs_directories:
         args += ["--tmpfs", str(path)]
+    for path in mounts.protected:
+        args += ["--ro-bind", path, path]
     if (worktree / ".git").is_file():
         args += ["--ro-bind", str(worktree / ".git"), str(worktree / ".git")]
     proxy = f"http://127.0.0.1:{PROXY_PORT}"
@@ -401,6 +406,25 @@ def prepare(state: Path, home_files: dict[str, str], python: str) -> Path:
     link.symlink_to(run.name)
     os.replace(link, state / "latest")
     return run
+
+
+@functools.cache
+def unavailable() -> str | None:
+    """Why the sandbox cannot run on this machine, or None when it can."""
+    if shutil.which("bwrap") is None:
+        return "bubblewrap is not installed"
+    if platform.machine() != "x86_64":
+        return f"the seccomp filter does not support {platform.machine()}"
+    # The probe runs this interpreter, which needs nothing from PATH.
+    probe = ["bwrap", "--unshare-all", "--unshare-user", "--disable-userns", "--ro-bind", "/", "/"]
+    probe += [sys.executable, "-I", "-c", ""]
+    try:
+        result = subprocess.run(probe, capture_output=True, text=True, errors="replace", timeout=30)
+    except (OSError, subprocess.TimeoutExpired) as error:
+        return f"bwrap does not start: {error}"
+    if result.returncode != 0:
+        return f"bwrap cannot create its namespaces: {' '.join(result.stderr.split())[-200:]}"
+    return None
 
 
 def cpu_list(requested: int | None) -> list[int] | None:

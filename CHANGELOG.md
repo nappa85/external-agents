@@ -68,6 +68,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `EXTERNAL_AGENTS_REVIEW_SANDBOX=1` runs reviewers in the bubblewrap sandbox that `code`
+  uses, with a shell, so they can search and run the tests; `codex` is confined there too.
+  Without a working bwrap they keep file tools only.
+- The handoff diff shows whole changed functions, so reviewers open fewer files.
 - `amp` reviewers can search: the generated mode adds `search_files` (a regular expression
   over file contents) and `find_files` (a glob over paths), confined to the snapshot like
   its file tools. Amp has no search tool of its own, so reviewers read whole files to find

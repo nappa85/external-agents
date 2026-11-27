@@ -24,21 +24,25 @@ import time
 import traceback
 from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
+from . import sandbox
 from .backends import (
     AMP_PLUGINS,
     AMP_SETTINGS,
     BACKENDS,
+    CODER_CREDENTIALS,
     INSTALLERS,
     PROJECT_CONFIG,
     REVIEW_MODEL_REQUIRED,
     VIBE_QUIET,
+    coder_hosts,
     parse_agent,
 )
 from .common import (
     ENV_AMP_NO_CREDITS,
+    ENV_REVIEW_SANDBOX,
     ENV_REVIEWERS,
     UsageError,
     agent_env,
@@ -59,6 +63,11 @@ INSTRUCTION = (
     "current directory and follow it. You may add or change files in the current directory, for "
     "example a regression test that demonstrates a finding; your changes are returned as a patch. "
     "Do not read or write files outside the current directory."
+)
+# Appended in the sandbox, where the reviewer has a shell.
+SANDBOX_INSTRUCTION = (
+    " You can run commands, such as the tests or a search, in a sandbox: the network reaches "
+    "only your model provider, so downloads fail."
 )
 UNAVAILABLE = re.compile(
     r"quota|credit|rate.?limit|insufficient|unauthori[sz]ed|forbidden|\b429\b|\b402\b|"
@@ -91,6 +100,10 @@ OPENCODE_REVIEWER = {
         }
     },
 }  # fmt: skip
+# In the sandbox, which confines commands itself, the reviewer also gets the shell.
+OPENCODE_SANDBOXED_REVIEWER = json.loads(json.dumps(OPENCODE_REVIEWER))
+OPENCODE_SANDBOXED_REVIEWER["agent"]["reviewer"]["tools"]["bash"] = True
+OPENCODE_SANDBOXED_REVIEWER["agent"]["reviewer"]["permission"]["bash"] = "allow"
 AMP_MODE = "external-reviewer"
 # The generated amp reviewer mode and the hook that confines it; see the file.
 AMP_PLUGIN = Path(__file__).with_name("amp_reviewer.js")
@@ -112,6 +125,13 @@ VIBE_REVIEWER_ENV = {
     "VIBE_TOOLS": json.dumps({
         tool: {"permission": "never"}
         for tool in ("bash", "git_bash", "powershell", "web_fetch", "web_search", "task")
+    }),
+}  # fmt: skip
+# In the sandbox, which confines commands itself, `bash` runs without approval.
+VIBE_SANDBOXED_REVIEWER_ENV = VIBE_REVIEWER_ENV | {
+    "VIBE_TOOLS": json.dumps({
+        "bash": {"permission": "always"},
+        **{tool: {"permission": "never"} for tool in ("git_bash", "powershell", "web_fetch", "web_search", "task")},
     }),
 }  # fmt: skip
 
@@ -137,6 +157,8 @@ class Reviewer:
     backend: str
     model: str | None
     effort: str | None = None
+    # Runs in the bubblewrap sandbox, with a shell; see `sandbox_reason`.
+    sandboxed: bool = False
 
     @property
     def label(self) -> str:
@@ -166,8 +188,12 @@ class Reviewer:
         model = ["--model", self.model] if self.model else []
         if self.backend == "codex":
             effort = ["-c", f'model_reasoning_effort="{self.effort}"'] if self.effort else []
+            # codex's own sandbox cannot start inside bubblewrap, which already confines it.
+            confined = (
+                ["--dangerously-bypass-approvals-and-sandbox"] if self.sandboxed else ["--sandbox", "workspace-write"]
+            )
             return [
-                "codex", "exec", "--sandbox", "workspace-write", "--skip-git-repo-check",
+                "codex", "exec", *confined, "--skip-git-repo-check",
                 "--color", "never", "--cd", str(snap),
                 "--output-last-message", str(last_message), *model, *effort, instruction,
             ]  # fmt: skip
@@ -176,10 +202,20 @@ class Reviewer:
             # while dontAsk denies those once the rule is absent. An `Edit` rule covers every
             # file-editing tool; `//` starts an absolute path.
             edits = [f"Edit(/{root}/**)" for root in snapshot_roots(snap)]
+            if self.sandboxed:
+                tools = ["--tools", "Read,Glob,Grep,Edit,Write,Bash", "--dangerously-skip-permissions"]
+            else:
+                tools = [
+                    "--tools",
+                    "Read,Glob,Grep,Edit,Write",
+                    "--permission-mode",
+                    "dontAsk",
+                    "--allowedTools",
+                    *edits,
+                ]
             return [
                 # User settings only: project settings in the reviewed tree could add hooks.
-                "claude", "-p", "--tools", "Read,Glob,Grep,Edit,Write", "--permission-mode", "dontAsk",
-                "--allowedTools", *edits, "--strict-mcp-config", "--setting-sources", "user",
+                "claude", "-p", *tools, "--strict-mcp-config", "--setting-sources", "user",
                 "--no-session-persistence", *model, *(["--effort", self.effort] if self.effort else []),
                 "--", instruction,
             ]  # fmt: skip
@@ -206,15 +242,23 @@ class Reviewer:
             "opencode", "run", "--dir", str(snap), "-m", str(self.model), "--agent", "reviewer", *effort, instruction,
         ]  # fmt: skip
 
+    def extra_env(self) -> dict[str, str]:
+        if self.backend != "vibe":
+            return {}
+        return VIBE_SANDBOXED_REVIEWER_ENV if self.sandboxed else VIBE_REVIEWER_ENV
+
     def env(self, snap: Path) -> dict[str, str]:
-        extra = VIBE_REVIEWER_ENV if self.backend == "vibe" else {}
-        return agent_env(snap, self.backend, self.model) | extra
+        return agent_env(snap, self.backend, self.model) | self.extra_env()
+
+    @property
+    def generated_paths(self) -> tuple[Path, ...]:
+        """The configuration the wrapper writes into the snapshot for this backend."""
+        return {"opencode": (Path("opencode.json"),), "amp": (AMP_PLUGINS.parent,)}.get(self.backend, ())
 
     @property
     def owned_paths(self) -> tuple[Path, ...]:
         """Paths the wrapper removes or generates for this backend, never the reviewer's changes."""
-        generated = {"opencode": (Path("opencode.json"),), "amp": (AMP_PLUGINS, AMP_SETTINGS)}
-        return (*PROJECT_CONFIG.get(self.backend, ()), *generated.get(self.backend, ()))
+        return (*PROJECT_CONFIG.get(self.backend, ()), *self.generated_paths)
 
     def prepare(self, snap: Path) -> None:
         """Write the backend's confined agent configuration into the snapshot.
@@ -224,7 +268,8 @@ class Reviewer:
         for relative in PROJECT_CONFIG.get(self.backend, ()):
             remove(snap / relative)
         if self.backend == "opencode":
-            write_generated(snap / "opencode.json", json.dumps(OPENCODE_REVIEWER, indent=2))
+            config = OPENCODE_SANDBOXED_REVIEWER if self.sandboxed else OPENCODE_REVIEWER
+            write_generated(snap / "opencode.json", json.dumps(config, indent=2))
         elif self.backend == "amp":
             # The reviewed tree may hold `.amp` as a file or a link; the generated mode
             # must land in a real directory inside the snapshot.
@@ -235,7 +280,8 @@ class Reviewer:
             plugins.mkdir(parents=True)
             effort = f"\n\t\treasoningEffort: {json.dumps(self.effort)}," if self.effort else ""
             root = json.dumps(str(snap.absolute()))
-            values = {"MODE": AMP_MODE, "MODEL": json.dumps(self.model), "EFFORT": effort, "ROOT": root}
+            shell = json.dumps(self.sandboxed)
+            values = {"MODE": AMP_MODE, "MODEL": json.dumps(self.model), "EFFORT": effort, "ROOT": root, "SHELL": shell}
             plugin = re.sub(r"__([A-Z]+)__", lambda match: values[match[1]], AMP_PLUGIN.read_text())
             write_generated(plugins / f"{AMP_MODE}.ts", plugin)
             # Passed as `--settings-file`, so neither the user's settings nor a copy from
@@ -541,6 +587,28 @@ def attempt(
         return run_attempt(reviewer, snap, Path(record), instruction, total, idle, log)
 
 
+@contextlib.contextmanager
+def sandboxed(
+    reviewer: Reviewer, snap: Path, record: Path, messages: Path, command: list[str]
+) -> Iterator[tuple[list[str], tuple[int, ...]]]:
+    """`command` wrapped to run in the coding sandbox on the snapshot, and the descriptors
+    it needs. The sandbox sees the snapshot, read-write except for the wrapper's generated
+    configuration, the directory for the last message, and the CLI with its login; its
+    network reaches only the model provider."""
+    mounts = sandbox.Mounts()
+    python = sandbox.python_for_forwarder(mounts)
+    executable = sandbox.bind_agent(reviewer.backend, reviewer.model, mounts)
+    # Running the tests must not leave caches that look like proposed changes.
+    mounts.env |= reviewer.extra_env() | {"PYTHONDONTWRITEBYTECODE": "1"}
+    mounts.protected = [str(snap / path) for path in reviewer.generated_paths if (snap / path).exists()]
+    mounts.rw.append((str(messages), str(messages)))
+    hosts = list(coder_hosts(reviewer.backend, reviewer.model))
+    # A run directory per attempt: slots run at once in one process.
+    (record / "sandbox").mkdir()
+    with sandbox.launch(snap, record / "sandbox", mounts, hosts, python, {}, ask=False) as (launcher, fds, _):
+        yield [*launcher, executable, *command[1:]], fds
+
+
 def run_attempt(
     reviewer: Reviewer, snap: Path, record: Path, instruction: str, total: float, idle: float, log: Path
 ) -> tuple[int, str, bytes]:
@@ -548,18 +616,24 @@ def run_attempt(
     before = changes.tree()
     with log.open("a") as header:
         header.write(f"\n=== {reviewer.label} at {dt.datetime.now().astimezone():%H:%M:%S %Z}: {instruction[:60]}\n")
-    with tempfile.TemporaryDirectory(prefix="xagents-msg-") as tmp:
+    with tempfile.TemporaryDirectory(prefix="xagents-msg-") as tmp, contextlib.ExitStack() as stack:
         last_message = Path(tmp) / "last-message.md"
         env = reviewer.env(snap)
+        command = reviewer.command(snap, instruction, last_message)
+        fds: tuple[int, ...] = ()
+        if reviewer.sandboxed:
+            command, fds = stack.enter_context(sandboxed(reviewer, snap, record, Path(tmp), command))
         watch = AmpWatch(snap, env, log) if reviewer.backend == "amp" else None
         code, output = run_with_timeouts(
-            reviewer.command(snap, instruction, last_message),
+            command,
             snap,
             total,
             reviewer.idle_timeout(idle) if reviewer.idle_timeout_applies else None,
-            env,
+            # In the sandbox the launcher builds the agent's environment from scratch.
+            {"PATH": os.environ.get("PATH", "")} if reviewer.sandboxed else env,
             log,
             on_idle=watch.on_idle if watch else None,
+            pass_fds=fds,
         )
         if watch is not None and watch.answer is not None:
             code, output = 0, watch.answer
@@ -687,7 +761,8 @@ def review_with_fallback(
             if options.preflight and not preflight(reviewer, pristine, run_log):
                 log.append(f"{reviewer.label}: preflight failed")
                 continue
-            code, output, changes = attempt(reviewer, pristine, INSTRUCTION, options.total, options.idle, run_log)
+            instruction = INSTRUCTION + (SANDBOX_INSTRUCTION if reviewer.sandboxed else "")
+            code, output, changes = attempt(reviewer, pristine, instruction, options.total, options.idle, run_log)
             state = classify(code, output, options.expect)
             if state == "stalled" and not reviewer.free:
                 # A paid model's request can hang without failing, and a model can think
@@ -695,7 +770,7 @@ def review_with_fallback(
                 # Free tiers stall from throttling, so they are not retried.
                 print(f"{reviewer.label}: stalled (exit {code}); retrying once.", file=sys.stderr)
                 code, output, changes = attempt(
-                    reviewer, pristine, INSTRUCTION, options.total, 2 * options.idle, run_log
+                    reviewer, pristine, instruction, options.total, 2 * options.idle, run_log
                 )
                 state = classify(code, output, options.expect)
             if reviewer.free and state in ("stalled", "unavailable"):
@@ -772,6 +847,19 @@ def detect_reviewers() -> dict[str, object]:
     }
 
 
+def sandbox_if_possible(reviewer: Reviewer) -> Reviewer:
+    """The reviewer in the sandbox, unless it could not log in there.
+
+    An amp signed in some other way, such as an Amp orb's thread identity, would wait for a
+    device login in the sandbox until the run times out."""
+    if reviewer.backend == "amp" and not (
+        os.environ.get("AMP_API_KEY") or any((sandbox.HOME / path).is_file() for path in CODER_CREDENTIALS["amp"])
+    ):
+        print(f"{reviewer.label}: no AMP_API_KEY or amp login file; it runs with file tools only.", file=sys.stderr)
+        return reviewer
+    return replace(reviewer, sandboxed=True)
+
+
 def review(args: argparse.Namespace) -> int:
     source = args.source.resolve()
     if not args.prompt_file.is_file():
@@ -781,6 +869,11 @@ def review(args: argparse.Namespace) -> int:
     panel = resolve_panel(args.reviewer, args.reviewers, os.environ.get(ENV_REVIEWERS))
     if not panel:
         raise UsageError(f"no external reviewer is configured; set {ENV_REVIEWERS} or pass --reviewers")
+    if os.environ.get(ENV_REVIEW_SANDBOX) == "1":
+        if reason := sandbox.unavailable():
+            print(f"{ENV_REVIEW_SANDBOX}: {reason}; reviewers run with file tools only.", file=sys.stderr)
+        else:
+            panel = [Slot(tuple(map(sandbox_if_possible, slot.reviewers)), slot.optional) for slot in panel]
     # Validated here, before the slots run, so a bad --include is a usage error (exit 2).
     check_includes(source, args.include)
     paths = output_paths(args, len(panel))

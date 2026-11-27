@@ -4,17 +4,20 @@
 //
 // The agent gets Read, create_file and edit_file, plus two search tools defined here,
 // since Amp has no grep or glob tool. apply_patch is left out because its paths are inside
-// the patch text. The tool.call hook decides every call: a tool must be one of these, its
-// path absolute and, links resolved, inside the snapshot, and writes to `.amp/` are
-// refused so the reviewer cannot rewrite this file. A plugin that fails to load leaves no
-// reviewer mode, so the run fails instead of going unchecked.
+// the patch text. In the bubblewrap sandbox, which confines commands itself, it also gets
+// the shell tools. The tool.call hook decides every call: a tool must be one of these, a
+// file tool's path absolute and, links resolved, inside the snapshot, and writes to `.amp/`
+// are refused so the reviewer cannot rewrite this file. A plugin that fails to load leaves
+// no reviewer mode, so the run fails instead of going unchecked.
 import { lstatSync, readdirSync, readFileSync, realpathSync } from 'node:fs'
 import path from 'node:path'
 
 const ROOT = realpathSync.native(__ROOT__)
 const CONFIG = path.join(ROOT, '.amp')
+const SHELL = __SHELL__
 const SEARCH_TOOLS = new Set(['search_files', 'find_files'])
-const TOOLS = new Set(['Read', 'create_file', 'edit_file', ...SEARCH_TOOLS])
+const SHELL_TOOLS = new Set(SHELL ? ['shell_command', 'shell_command_status', 'shell_command_kill'] : [])
+const TOOLS = new Set(['Read', 'create_file', 'edit_file', ...SEARCH_TOOLS, ...SHELL_TOOLS])
 // Results per search, and the largest file searched.
 const LIMIT = 200
 const MAX_FILE = 1 << 20
@@ -48,6 +51,7 @@ function realLocation(target) {
 // Why the call must not run, or null. A search without a path covers the whole snapshot.
 function refusal(tool, input) {
 	if (!TOOLS.has(tool)) return `Only ${[...TOOLS].join(', ')} are available.`
+	if (SHELL_TOOLS.has(tool)) return null
 	const target = input.path ?? (SEARCH_TOOLS.has(tool) ? ROOT : undefined)
 	if (typeof target !== 'string' || !path.isAbsolute(target)) return 'Use an absolute path.'
 	if (target.split(path.sep).includes('..')) return 'Paths must not contain `..`.'
@@ -154,8 +158,9 @@ export default function (amp) {
 	const agent = amp.createAgent({
 		model: __MODEL__,
 		tools: { include: [...TOOLS], exclude: ['tool_search', 'code_exec'] },__EFFORT__
-		instructions:
-			'You are a reviewer. You can read, search and change files in your working directory but cannot run commands.',
+		instructions: SHELL
+			? 'You are a reviewer. You can read, search and change files in your working directory and run commands in a sandbox.'
+			: 'You are a reviewer. You can read, search and change files in your working directory but cannot run commands.',
 	})
 	amp.registerAgentMode({ key: '__MODE__', label: '__MODE__', agent: agent.definition })
 	amp.on('tool.call', async (event) => {
