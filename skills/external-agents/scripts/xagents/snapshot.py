@@ -63,15 +63,11 @@ def copy_entry(source: Path, dest: Path, relative: Path) -> None:
     shutil.copy2(origin, target)
 
 
-def snapshot(source: Path, dest: Path, extra: list[Path], exclude: Iterable[Path] = ()) -> None:
-    """Copy the reviewable files of `source` into a new `dest`, plus the `extra` ignored
-    files, without the `exclude` paths."""
-    dest.mkdir(parents=True)
-    excluded = Exclusions(exclude)
-    for relative in source_files(source):
-        if not is_secret(relative) and source / relative not in excluded:
-            copy_entry(source, dest, relative)
+def check_includes(source: Path, extra: list[Path]) -> list[Path]:
+    """The `--include` paths relative to `source`; a usage error for any outside it, secret-like,
+    or not a file."""
     root = source.resolve()
+    relatives = []
     for path in extra:
         resolved = (path if path.is_absolute() else source / path).resolve()
         if not resolved.is_relative_to(root):
@@ -81,6 +77,20 @@ def snapshot(source: Path, dest: Path, extra: list[Path], exclude: Iterable[Path
             raise UsageError(f"refusing to include secret-like file {relative}")
         if not (source / relative).is_file():
             raise UsageError(f"--include {relative} is not a file in the source tree")
+        relatives.append(relative)
+    return relatives
+
+
+def snapshot(source: Path, dest: Path, extra: list[Path], exclude: Iterable[Path] = ()) -> None:
+    """Copy the reviewable files of `source` into a new `dest`, plus the `extra` ignored
+    files, without the `exclude` paths."""
+    includes = check_includes(source, extra)
+    dest.mkdir(parents=True)
+    excluded = Exclusions(exclude)
+    for relative in source_files(source):
+        if not is_secret(relative) and source / relative not in excluded:
+            copy_entry(source, dest, relative)
+    for relative in includes:
         if source / relative not in excluded:
             copy_entry(source, dest, relative)
     leftovers = [p for p in dest.rglob("*") if is_secret(p.relative_to(dest)) and not p.is_dir()]
@@ -93,7 +103,8 @@ QUOTED = re.compile(r'"(?:[^"\\]|\\.)*"')
 
 
 def unquote(token: str) -> str:
-    """A path token as Git writes it, quoted or not, as a path."""
+    """A path token as Git writes it, quoted or not, as a path. A quoted token with an
+    invalid escape raises ValueError."""
     if QUOTED.fullmatch(token):
         raw = codecs.escape_decode(token[1:-1].encode(errors="surrogateescape"))[0]
         return raw.decode(errors="surrogateescape")
@@ -133,35 +144,77 @@ def plain_path(line: str, prefix: str) -> str | None:
     return token.removeprefix(prefix)
 
 
+HUNK_HEADER = re.compile(r"^@@ -\d+(?:,(\d+))? \+\d+(?:,(\d+))? @@")
+
+
 def split_sections(lines: list[str]) -> list[tuple[str, list[str]]]:
     """The patch's preamble, then one section per file: `git` for a `diff --git` header,
-    `plain` for any other `diff` line or a bare `---`/`+++` pair, as `diff -u` writes."""
+    `plain` for any other `diff` line or a bare `---`/`+++` pair, as `diff -u` writes.
+
+    A hunk's body is consumed by the line counts in its `@@` header, so a removed `-- x` or
+    added `++ y` line is never taken for a file header. A hunk that runs past its counts
+    stays with its file: a misread then drops lines rather than detaching them. Text after a
+    file's hunks that starts no hunk and no file goes to an `unknown` section, which is
+    dropped: nothing reaches the reviewer unless it is attributed to a file."""
     sections: list[tuple[str, list[str]]] = [("preamble", [])]
-    in_hunks = False
+    old = new = 0  # lines of the current hunk still to come
+    had_hunk = False  # whether the current section has reached its hunks
     for index, line in enumerate(lines):
+        if old > 0 or new > 0:
+            sections[-1][1].append(line)
+            if line.startswith(" "):
+                old, new = old - 1, new - 1
+            elif line.startswith("-"):
+                old -= 1
+            elif line.startswith("+"):
+                new -= 1
+            elif not line.startswith("\\"):
+                old = new = 0  # not a hunk line: the counts were wrong
+            continue
         bare_pair = (
             line.startswith("--- ")
             and index + 2 < len(lines)
             and lines[index + 1].startswith("+++ ")
-            and lines[index + 2].startswith("@@")
+            and HUNK_HEADER.match(lines[index + 2]) is not None
         )
         if line.startswith("diff "):
             sections.append(("git" if line.startswith("diff --git ") else "plain", [line]))
-            in_hunks = False
-        elif bare_pair and (in_hunks or sections[-1][0] == "preamble"):
+            had_hunk = False
+        elif bare_pair and (sections[-1][0] != "git" or had_hunk):
+            # A git section's own `---`/`+++` lines come before its first hunk.
             sections.append(("plain", [line]))
-            in_hunks = False
+            had_hunk = False
+        elif had_hunk and not HUNK_HEADER.match(line) and not line.startswith("\\"):
+            sections.append(("unknown", [line]))
+            had_hunk = False
         else:
             sections[-1][1].append(line)
-            in_hunks = in_hunks or line.startswith("@@")
+            if match := HUNK_HEADER.match(line):
+                had_hunk = True
+                old, new = (int(count) if count is not None else 1 for count in match.groups())
     return sections
+
+
+# Lines that would carry file content in a diff format the filter does not parse, such as
+# `diff -c` or an `Index:` header: a preamble that holds one is dropped.
+FOREIGN_HEADERS = ("*** ", "--- ", "+++ ", "@@", "Index: ", "==== ")
 
 
 def judge(kind: str, lines: list[str]) -> tuple[bool, str | None]:
     """Whether to keep a section, and its `STATUS<TAB>path` manifest line. A section is
     kept only when every path it names is known and none is secret-like: fail closed."""
     if kind == "preamble":
-        return True, None
+        # A commit message before the first file, as `git format-patch` writes, is kept.
+        return not any(line.startswith(FOREIGN_HEADERS) for line in lines), None
+    if kind == "unknown":
+        return False, None
+    try:
+        return judge_file(kind, lines)
+    except ValueError:  # a quoted path with an invalid escape
+        return False, None
+
+
+def judge_file(kind: str, lines: list[str]) -> tuple[bool, str | None]:
     header = [line.rstrip("\r\n") for line in lines]
     if "@@" in (line[:2] for line in header):
         header = header[: [line[:2] for line in header].index("@@")]
@@ -230,17 +283,27 @@ def base_diff(source: Path, base: str, exclude: Iterable[Path] = ()) -> str:
     index, so one `git diff` covers everything and the repository's index is untouched."""
     excluded = Exclusions(exclude)
     listing = git(source, "ls-files", "-z", "--others", "--exclude-standard")
-    untracked = [entry for entry in listing.split("\0") if entry and source / entry not in excluded]
+    # An entry ending in `/` is a nested repository Git does not descend into.
+    untracked = [
+        entry for entry in listing.split("\0") if entry and not entry.endswith("/") and source / entry not in excluded
+    ]
+    # Excluded files the repository tracks, such as a committed review, leave the diff too.
+    root = source.resolve()
+    pathspecs = [
+        f":(exclude,literal){path.relative_to(root).as_posix()}"
+        for path in excluded.paths
+        if path.is_relative_to(root) and path != root
+    ]
     index = Path(git(source, "rev-parse", "--path-format=absolute", "--git-path", "index").strip())
     with tempfile.TemporaryDirectory(prefix="xagents-index-") as tmp:
         temporary = Path(tmp, "index")
         if index.is_file():
             shutil.copyfile(index, temporary)
-        env = {**os.environ, "GIT_INDEX_FILE": str(temporary), "GIT_LITERAL_PATHSPECS": "1"}
+        env = {**os.environ, "GIT_INDEX_FILE": str(temporary)}
         if untracked:
-            names = "\0".join(untracked).encode(errors="surrogateescape")
+            names = "\0".join(f":(literal){entry}" for entry in untracked).encode(errors="surrogateescape")
             git(source, "add", "--intent-to-add", "--pathspec-from-file=-", "--pathspec-file-nul", stdin=names, env=env)
-        return git(source, "diff", *DIFF_OPTIONS, base, "--", env=env)
+        return git(source, "diff", *DIFF_OPTIONS, base, "--", ".", *pathspecs, env=env)
 
 
 # Unset every attribute that converts content between the work tree and Git.
@@ -276,13 +339,15 @@ class Changes:
         if self.git_dir.is_symlink() or not self.git_dir.is_dir():
             raise UsageError(f"cannot record the agent's changes: {self.git_dir} was replaced")
         write_generated(self.git_dir / "config", self.config)
-        for name in ("info", "commondir", "config.worktree"):
+        for name in ("info", "hooks", "commondir", "config.worktree"):
             remove(self.git_dir / name)
         (self.git_dir / "info").mkdir()
         (self.git_dir / "info" / "attributes").write_text(RAW_ATTRIBUTES)
 
     def run(self, *args: str, stdin: bytes | None = None) -> bytes:
-        result = subprocess.run(["git", *args], cwd=self.work_tree, env=self.env, input=stdin, capture_output=True)
+        # No hook runs, wherever one was planted: `git add` would run post-index-change.
+        command = ["git", "-c", f"core.hooksPath={os.devnull}", *args]
+        result = subprocess.run(command, cwd=self.work_tree, env=self.env, input=stdin, capture_output=True)
         if result.returncode != 0:
             raise UsageError(f"cannot record the agent's changes: {result.stderr.decode(errors='replace').strip()}")
         return result.stdout

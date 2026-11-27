@@ -48,7 +48,7 @@ from .common import (
     run_with_timeouts,
     write_generated,
 )
-from .snapshot import Changes, base_diff, filter_patch, snapshot
+from .snapshot import Changes, base_diff, check_includes, filter_patch, snapshot
 
 PROMPT_FILE = "REVIEW_PROMPT.md"
 DIFF_FILE = "REVIEW_DIFF.patch"
@@ -481,21 +481,33 @@ def amp_thread_state(thread: str, cwd: Path, env: dict[str, str], timeout: float
     silent or gone: `working` while a model turn is in flight, `answered` with the final
     text once a turn ended without a tool call, `stopped` after a turn that ended asking
     for a tool, which only the CLI runs, or `unknown` when the thread cannot be read."""
+    if timeout <= 0:
+        return "unknown", None
     try:
         result = subprocess.run(
             ["amp", "threads", "export", thread], cwd=cwd, env=env, capture_output=True, timeout=timeout, check=False
         )
-        messages = json.loads(result.stdout)["messages"]
-        last = messages[-1]
-    except (OSError, subprocess.TimeoutExpired, ValueError, KeyError, IndexError, TypeError):
+        export = json.loads(result.stdout)
+    except (OSError, subprocess.TimeoutExpired, ValueError):
         return "unknown", None
+    messages = export.get("messages") if isinstance(export, dict) else None
+    last = messages[-1] if isinstance(messages, list) and messages else None
     if not isinstance(last, dict):
         return "unknown", None
-    if last.get("role") != "assistant" or (last.get("state") or {}).get("type") != "complete":
+    state = last.get("state")
+    if last.get("role") != "assistant" or state is None:
         return "working", None
-    content = last.get("content") or []
-    text = "\n\n".join(str(b.get("text")) for b in content if isinstance(b, dict) and b.get("type") == "text")
-    if (last.get("state") or {}).get("stopReason") == "end_turn" and text.strip():
+    if not isinstance(state, dict):
+        return "unknown", None
+    if state.get("type") != "complete":
+        return "working", None
+    content = last.get("content")
+    texts = [
+        b["text"] for b in (content if isinstance(content, list) else []) if isinstance(b, dict)
+        and b.get("type") == "text" and isinstance(b.get("text"), str)
+    ]  # fmt: skip
+    text = "\n\n".join(texts)
+    if state.get("stopReason") == "end_turn" and text.strip():
         return "answered", text
     return "stopped", None
 
@@ -520,11 +532,12 @@ class AmpWatch:
         with self.log.open("a") as out:
             out.write(f"\n[{message}]\n")
 
-    def on_idle(self, output: str) -> bool:
+    def on_idle(self, output: str, remaining: float) -> bool:
         self.thread = self.thread or amp_session(output)
         if self.thread is None:
             return False
-        state, text = amp_thread_state(self.thread, self.cwd, self.env)
+        # The check must not carry the run past its total deadline.
+        state, text = amp_thread_state(self.thread, self.cwd, self.env, timeout=min(60.0, remaining))
         if state == "answered":
             self.answer = text
             self.note(f"the server finished {self.thread} while the CLI was silent; taking its answer")
@@ -793,12 +806,13 @@ def review(args: argparse.Namespace) -> int:
     panel = resolve_panel(args.reviewer, args.reviewers, os.environ.get(ENV_REVIEWERS))
     if not panel:
         raise UsageError(f"no external reviewer is configured; set {ENV_REVIEWERS} or pass --reviewers")
+    # Validated here, before the slots run, so a bad --include is a usage error (exit 2).
+    check_includes(source, args.include)
     paths = output_paths(args, len(panel))
     # The review's own inputs and outputs stay out of what the reviewers see: the supplied
     # diff only after filtering, and no earlier review or its patch.
     exclude = [
         *([args.diff_file] if args.diff_file else []),
-        *([args.output_dir] if args.output_dir is not None else []),
         *(path.with_suffix(suffix) for path in paths for suffix in (".md", ".log", ".patch")),
         *paths,
     ]

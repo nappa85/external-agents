@@ -201,6 +201,15 @@ class Mailbox(unittest.TestCase):
         with self.assertRaisesRegex(common.UsageError, "timeout must be a number"):
             mailbox.request(self.state, {"op": "question", "wait": True, "timeout": "soon"})
 
+    def test_a_timeout_no_lock_can_wait_gets_an_error_not_a_false_run_end(self) -> None:
+        # `inf` overflowed `Condition.wait`, which looked like the run ending; `nan` spun forever.
+        for timeout in ("inf", "nan", "1e300", "-1"):
+            with self.subTest(timeout=timeout):
+                shown = self.cli("question", "--wait", "--timeout", timeout)
+
+                self.assertEqual(shown.returncode, 2, shown.stderr)
+                self.assertIn("timeout must be", shown.stderr)
+
     def test_a_malformed_control_request_gets_an_error(self) -> None:
         client = socket.socket(socket.AF_UNIX)
         self.addCleanup(client.close)

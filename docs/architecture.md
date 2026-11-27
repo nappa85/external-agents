@@ -51,8 +51,9 @@ skills/external-agents/scripts/
    machine under a file lock, and one that stalls or fails is recorded in a daily
    ledger and skipped until the next UTC day.
 7. **Changes.** Before and after each attempt, the snapshot is recorded in a private
-   Git repository next to it (no user or system configuration; attributes that would
-   convert content are unset). The diff, minus handoff files, generated configuration,
+   Git repository under the state directory, out of every reviewer's reach (no user or
+   system configuration, no hooks; its config and attributes are rewritten before every
+   git command, and attributes that would convert content are unset). The diff, minus handoff files, generated configuration,
    and secret-like files, becomes `review-<n>.patch`.
 
 ## Coding sandbox

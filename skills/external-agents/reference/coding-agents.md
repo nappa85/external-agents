@@ -76,7 +76,10 @@ widen its own affinity, so the CPU limit is cooperative.
   read-only, `<state>/target` as `CARGO_TARGET_DIR`, and Cargo offline. Fetch
   dependencies on the host first (`cargo fetch`).
 - `--ro PATH` and `--rw PATH` bind other paths at the same place. A path that contains
-  your home directory, or the root, is refused.
+  your home directory, or the root, is refused, and so is one that overlaps the state
+  directory (its control socket would let the agent answer itself) or, for `--rw`, the
+  main repository's git directory (its hooks run on the host). A worktree with submodules
+  is refused.
 - `--env KEY=VALUE` sets a variable inside.
 
 ## Questions
@@ -108,7 +111,8 @@ the fresh HOME, the two sockets, the question log, and the seccomp filter, and p
 `latest` at it.
 Preset caches such as `target/` persist across runs.
 
-Exit status is the agent's own, or 124 when `--timeout` (default 7200 s) stops it.
+Exit status is the agent's own, 128+N when signal N killed it, or 124 when `--timeout`
+(default 7200 s) stops it.
 The agent's output goes to the launcher's stdout and stderr; redirect it to a log.
 
 ## Backends

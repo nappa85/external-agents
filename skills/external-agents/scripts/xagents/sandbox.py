@@ -301,11 +301,11 @@ def submodule_paths(worktree: Path) -> list[str]:
 def git_common_dir(worktree: Path) -> Path | None:
     """The main repository's git directory, which holds the worktree's hooks and config."""
     result = subprocess.run(
-        ["git", "-C", str(worktree), "rev-parse", "--path-format=absolute", "--git-common-dir"],
-        capture_output=True,
-        text=True,
+        ["git", "-C", str(worktree), "rev-parse", "--path-format=absolute", "--git-common-dir"], capture_output=True
     )
-    return Path(result.stdout.strip()).resolve() if result.returncode == 0 and result.stdout.strip() else None
+    # Bytes: the path may not be UTF-8. Only the terminating newline is Git's.
+    path = os.fsdecode(result.stdout.removesuffix(b"\n"))
+    return Path(path).resolve() if result.returncode == 0 and path else None
 
 
 def overlaps(a: Path, b: Path) -> bool:

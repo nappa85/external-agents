@@ -96,7 +96,7 @@ Runs the panel on a snapshot of a Git checkout.
 | `--output-dir DIR`        | one `review-<n>.md` per slot (or `--output FILE` for a one-slot panel)          |
 | `--source DIR`            | checkout to snapshot (default: current directory)                               |
 | `--base REV`              | diff from `REV` to the working tree, untracked files included, as `REVIEW_DIFF.patch` |
-| `--diff-file FILE`        | use a precomputed Git-format diff instead                                       |
+| `--diff-file FILE`        | use a precomputed Git or unified diff instead; text it cannot attribute to a file is dropped |
 | `--include PATH`          | add an ignored file, such as a plan; repeatable                                 |
 | `--reviewers PANEL`       | override `EXTERNAL_REVIEWERS` for this run                                      |
 | `--reviewer AGENT`        | override with one slot; repeat for fallbacks                                    |
@@ -135,12 +135,12 @@ of the agent, to check it: `-- <backend> --version` checks that the agent starts
 | `--timeout S`      | stop the agent after S seconds (default 7200)                               |
 | `--no-seccomp`     | allow running without the seccomp filter on non-x86_64 hosts                |
 
-Exit: the agent's own status; 124 on timeout; 2 usage error.
+Exit: the agent's own status; 128+N when a signal N killed it; 124 on timeout; 2 usage error.
 
 ## `question --state DIR [--wait] [--timeout S]`
 
 Prints the coding agent's oldest unanswered question on stdout and
-`xagents: question <id>` on stderr.
+`xagents: question <id>, answer with --to <run>:<id>` on stderr.
 
 Exit: 0 a question was printed; 1 none waiting (or `--timeout` passed); 4 no active run,
 or the run ended during `--wait`.

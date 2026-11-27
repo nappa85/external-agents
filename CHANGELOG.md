@@ -11,14 +11,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A `codex` reviewer could write the configuration of the repository that records its
   changes, next to its snapshot in `/tmp`, and make the wrapper's own `git` run commands on
   the host (`core.fsmonitor`, filter drivers). The repository now lives under the state
-  directory and its configuration is rewritten before every git command.
+  directory, its configuration is rewritten before every git command, and no hook runs.
 - A coding agent could repoint a submodule's `.git` file, or `git init` an uninitialised
   submodule, so the host's next `git status` ran its commands. `code` refuses worktrees
   with submodules, and masks nested `.git` files.
 - `--ro` over the state directory let the agent answer its own questions through the
   control socket, and `--rw` over the main checkout let it write hooks; both are refused.
 - The diff filter let secrets through in plain `diff -u` patches, CRLF patches, and headers
-  whose path contains ` b/`; it now fails closed on every section it cannot attribute. A
+  whose path contains ` b/`; it now reads hunks by their line counts and drops any text
+  it cannot attribute to a file, such as a `diff -c` section. A
   `--diff-file` inside the checkout, and earlier review output, no longer reach the
   snapshot unfiltered. A tracked directory replaced by a link to `.git` is no longer copied.
 - Agents receive only their own provider's credentials, not every provider's; the
@@ -46,8 +47,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   timeout. A stale `review-<n>.patch` survived a rerun. A preflight passed when the CLI only
   echoed the prompt. Unexpected `amp` event shapes and `--output` in a missing directory
   ended in a traceback. The free-tier ledger now applies to a model at every effort.
+- `--output-dir` at the checkout root no longer hides the checkout, a committed review
+  file stays out of `--base`, an untracked repository without commits no longer aborts
+  `--base`, and a refused `--include` exits 2 again.
 - `answer --to` takes the `run-...:N` token `question` prints, so a late answer cannot reach
-  a newer run. A malformed control request gets an error instead of a false "run ended".
+  a newer run. A malformed, infinite or NaN `--timeout` gets an error instead of a false "run ended"
+  or a spinning mailbox.
 - `--env` now overrides inherited credentials; `--hosts ""` allows no host and spaces in
   `--hosts` are ignored; a signal-killed agent exits 128+N; `detect` and the bubblewrap
   installer probe the flags `code` uses, and the installer no longer needs sudo when bwrap

@@ -55,6 +55,12 @@ class TlsName(unittest.TestCase):
     def test_the_server_name_is_read_from_a_real_client_hello(self) -> None:
         self.assertEqual(proxy.client_hello_sni(client_hello("ChatGPT.com")), "chatgpt.com")
 
+    def test_the_server_name_is_read_when_other_records_follow_the_client_hello(self) -> None:
+        change_cipher_spec = b"\x14\x03\x03\x00\x01\x01"
+
+        self.assertEqual(proxy.client_hello_sni(client_hello("chatgpt.com") + change_cipher_spec), "chatgpt.com")
+        self.assertIsNone(proxy.client_hello_sni(change_cipher_spec + client_hello("chatgpt.com")))
+
     def test_a_truncated_or_foreign_first_flight_has_no_name(self) -> None:
         hello = client_hello("chatgpt.com")
         self.assertIsNone(proxy.client_hello_sni(hello[:40]))

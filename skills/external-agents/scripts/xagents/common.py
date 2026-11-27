@@ -200,12 +200,13 @@ def run_with_timeouts(
     idle: float | None,
     env: dict[str, str],
     log: Path | None = None,
-    on_idle: Callable[[str], bool] | None = None,
+    on_idle: Callable[[str, float], bool] | None = None,
 ) -> tuple[int, str]:
     """Kill the run if it exceeds `total` seconds or, when `idle` is set, is silent that long.
 
-    When the idle deadline passes, `on_idle`, given the output so far, may return True to
-    grant another idle period instead, for a CLI whose progress shows elsewhere.
+    When the idle deadline passes, `on_idle`, given the output so far and the seconds left
+    before the total deadline, may return True to grant another idle period instead, for a
+    CLI whose progress shows elsewhere; it must return within those seconds.
     Returns the exit code (124 on a timeout) and the combined output without ANSI escapes.
     The raw output is also appended to `log` as it arrives, so a run that is killed
     leaves a record of what it was doing."""
@@ -247,9 +248,12 @@ def run_with_timeouts(
         while True:
             now = time.monotonic()
             idle_expired = idle is not None and now - last > idle
-            if idle_expired and now - start <= total and on_idle is not None and on_idle(text()):
+            if idle_expired and now - start < total and on_idle is not None and on_idle(text(), total - (now - start)):
                 last = time.monotonic()
                 continue
+            now = time.monotonic()
+            if now - start > total:
+                idle_expired = False  # the total deadline passed, whatever else happened
             if now - start > total or idle_expired:
                 proc.kill()
                 proc.wait()

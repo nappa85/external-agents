@@ -46,11 +46,13 @@ class Reader:
 
 def handshake_bytes(data):
     """The handshake bytes of the TLS records at the start of `data`, which may split one
-    handshake message across several records; None when a record is not a handshake."""
+    handshake message across several records. Collecting stops at the first record of
+    another type, such as the ChangeCipherSpec or early data a client sends right after its
+    ClientHello; None when the very first record is not a handshake."""
     out, pos = b"", 0
     while pos + 5 <= len(data):
         if data[pos] != 0x16:
-            return None
+            return out if pos else None
         size = int.from_bytes(data[pos + 3 : pos + 5], "big")
         if pos + 5 + size > len(data):
             break

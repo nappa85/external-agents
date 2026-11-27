@@ -7,6 +7,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -189,6 +190,25 @@ class SnapshotTests(Sandbox):
         self.assertIn(b"+b", diff)
         self.assertEqual(sorted(p.name for p in self.root.glob("ran-*")), [])
 
+    def test_changes_ignore_a_hook_planted_in_the_recording_repository(self) -> None:
+        snap = self.root / "snap"
+        snap.mkdir()
+        (snap / "a.txt").write_text("a\n")
+        git_dir = self.root / "changes.git"
+        changes = snapshot.Changes(git_dir, snap, ())
+        before = changes.tree()
+        marker = self.root / "ran-hook"
+        hook = git_dir / "hooks" / "post-index-change"
+        hook.parent.mkdir(exist_ok=True)
+        hook.write_text(f"#!/bin/sh\ntouch {marker}\n")
+        hook.chmod(0o755)
+        (snap / "a.txt").write_text("b\n")
+
+        diff = changes.diff(before, changes.tree())
+
+        self.assertIn(b"+b", diff)
+        self.assertFalse(marker.exists())
+
     def test_non_utf8_content_and_names_survive_snapshot_and_diff(self) -> None:
         # Latin-1 fixtures and file names are ordinary in real repositories.
         (self.repo / "src/lib.rs").write_bytes(b"caf\xe9\n")
@@ -203,6 +223,14 @@ class SnapshotTests(Sandbox):
 
         self.assertIn("diff --git a/src/lib.rs b/src/lib.rs", diff)
         self.assertTrue((self.root / "snap" / name).is_file())
+
+    def test_base_diff_copes_with_an_untracked_repository_without_commits(self) -> None:
+        git(self.repo, "init", "-q", "scratch")
+        self.write("src/lib.rs", "fn changed() {}\n")
+
+        diff = snapshot.base_diff(self.repo, "HEAD")
+
+        self.assertIn("+fn changed() {}", diff)
 
     def test_diff_omits_tracked_and_untracked_secret_files(self) -> None:
         self.write("config/.env", "TOKEN=old\n")
@@ -668,6 +696,42 @@ class ReviewerSelectionTests(Sandbox):
         self.assertNotIn("Traceback", result.stderr)
         self.assertEqual(result.returncode, 2, result.stderr)
 
+    def test_an_output_dir_at_the_source_root_still_shows_the_sources(self) -> None:
+        self.fake("claude", "test -f src/lib.rs && test -f AGENTS.md && echo sources visible")
+
+        result = self.run_script(
+            "review", "--prompt-file", str(self.prompt), "--no-preflight", "--reviewer", "claude",
+            "--output-dir", ".",
+        )  # fmt: skip
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("sources visible", (self.repo / "review-1.md").read_text())
+
+    def test_a_refused_include_is_still_a_usage_error(self) -> None:
+        self.write(".env", "TOKEN=x\n")
+        self.fake("claude", "echo review")
+
+        result = self.review("--include", ".env")
+
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("secret-like", result.stderr)
+
+    def test_a_committed_review_artifact_stays_out_of_the_base_diff(self) -> None:
+        self.write("reviews/review-1.md", "old review\n")
+        git(self.repo, "add", "-A")
+        git(self.repo, "commit", "-q", "-m", "review")
+        self.write("reviews/review-1.md", "edited review\n")
+        self.write("src/lib.rs", "fn changed() {}\n")
+        self.fake("claude", "cat REVIEW_FILES.txt")
+
+        result = self.run_script(
+            "review", "--prompt-file", str(self.prompt), "--no-preflight", "--reviewer", "claude",
+            "--output-dir", str(self.repo / "reviews"), "--base", "HEAD",
+        )  # fmt: skip
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual((self.repo / "reviews/review-1.md").read_text(), "reviewer: claude\nM\tsrc/lib.rs\n")
+
     def test_missing_diff_file_is_a_usage_error(self) -> None:
         self.fake("claude", "echo review")
 
@@ -909,6 +973,35 @@ class FreeTierAndCompletenessTests(Sandbox):
         log = self.output.with_suffix(".log").read_text()
         self.assertIn("T-1 is still working on the server", log)
 
+    def test_the_amp_server_check_does_not_outlast_the_total_timeout(self) -> None:
+        init = json.dumps({"type": "system", "subtype": "init", "session_id": "T-1"})
+        self.fake("amp", f"[ \"$1\" = threads ] && {{ sleep 30; exit 1; }}\necho '{init}'\nsleep 30")
+        started = time.monotonic()
+
+        result = self.panel("amp:p/model", "--timeout", "3")
+
+        self.assertLess(time.monotonic() - started, 15)
+        self.assertEqual(result.returncode, 3, result.stderr)
+        self.assertIn("amp:p/model: timed out", result.stderr)
+        self.assertNotIn("retrying once", result.stderr)
+
+    def test_unexpected_amp_export_shapes_count_as_unknown(self) -> None:
+        exports = [
+            {"messages": [{"role": "assistant", "state": "complete", "content": []}]},
+            {"messages": [{"role": "assistant", "state": {"type": "complete", "stopReason": "end_turn"}, "content": 1}]},
+            {"messages": [{"role": "assistant", "state": {"type": "complete", "stopReason": "end_turn"},
+                           "content": [{"type": "text", "text": None}]}]},
+            {"messages": "none"},
+            [],
+        ]  # fmt: skip
+        for export in exports:
+            with self.subTest(export=export):
+                self.fake("amp", f"echo '{json.dumps(export)}'")
+                with mock.patch.dict(os.environ, {"PATH": f"{self.bin}:{self.tools}"}):
+                    state, text = review.amp_thread_state("T-1", self.root, dict(os.environ))
+                self.assertIn(state, ("unknown", "stopped"))
+                self.assertIsNone(text)
+
     def test_a_high_effort_reviewer_may_stay_silent_longer(self) -> None:
         # No server to ask: the idle timeout itself grows with the effort.
         self.fake("opencode", "sleep 1.5; echo review")
@@ -1012,6 +1105,29 @@ class PatchFilterTests(unittest.TestCase):
 
         self.assertNotIn("TOKEN", diff)
         self.assertEqual(names, "")
+
+    def test_hunk_lines_that_look_like_file_headers_do_not_end_a_secret_file(self) -> None:
+        # A removed `-- x` and an added `++ y` line, then the next hunk, read like a new file.
+        patch = (
+            "diff --git a/.env b/.env\n--- a/.env\n+++ b/.env\n@@ -1 +1 @@\n"
+            "--- old\n+++ new\n@@ -9 +9 @@\n-TOKEN=old-secret\n+TOKEN=new-secret\n"
+        )
+
+        self.assertEqual(snapshot.filter_patch(patch), ("", ""))
+
+    def test_an_invalid_escape_in_a_quoted_header_drops_its_file(self) -> None:
+        patch = 'diff --git "a/\\xz" "b/\\xz"\n+TOKEN=secret\ndiff --git a/ok.rs b/ok.rs\n+fn ok() {}\n'
+
+        self.assertEqual(snapshot.filter_patch(patch), ("diff --git a/ok.rs b/ok.rs\n+fn ok() {}\n", "M\tok.rs\n"))
+
+    def test_a_diff_format_the_filter_cannot_read_is_dropped(self) -> None:
+        context = "*** a/.env\t2026\n--- b/.env\t2026\n***************\n*** 1 ****\n! TOKEN=a\n--- 1 ----\n! TOKEN=b\n"
+        git_then_context = "diff --git a/a.rs b/a.rs\n--- a/a.rs\n+++ b/a.rs\n@@ -1 +1 @@\n-x\n+y\n" + context
+
+        self.assertEqual(snapshot.filter_patch(context), ("", ""))
+        diff, names = snapshot.filter_patch(git_then_context)
+        self.assertNotIn("TOKEN", diff)
+        self.assertEqual(names, "M\ta.rs\n")
 
     def test_a_secret_in_a_plain_unified_diff_is_filtered(self) -> None:
         # `--diff-file` accepts any diff, such as one from `diff -ruN` or another VCS,

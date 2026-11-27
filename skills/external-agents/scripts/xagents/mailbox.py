@@ -18,6 +18,7 @@ from __future__ import annotations
 import contextlib
 import datetime as dt
 import json
+import math
 import os
 import select
 import socket
@@ -177,6 +178,19 @@ def receive_line(conn: socket.socket, deadline: float) -> bytes | None:
     return line if newline and len(line) <= MAX_REQUEST else None
 
 
+def valid_timeout(timeout: object) -> bool:
+    """None, or a finite number of seconds a lock can wait: `inf` overflows `Condition.wait`
+    and `nan` makes it spin."""
+    if timeout is None:
+        return True
+    return (
+        isinstance(timeout, (int, float))
+        and not isinstance(timeout, bool)
+        and math.isfinite(timeout)
+        and 0 <= timeout <= threading.TIMEOUT_MAX
+    )
+
+
 class Server:
     """Serves the agent socket and the control socket until `close`."""
 
@@ -246,8 +260,8 @@ class Server:
             request = None
         if not isinstance(request, dict):
             reply: dict[str, object] = {"error": "malformed request"}
-        elif request.get("op") == "question" and not isinstance(request.get("timeout", 0), (int, float, type(None))):
-            reply = {"error": "timeout must be a number"}
+        elif request.get("op") == "question" and not valid_timeout(request.get("timeout")):
+            reply = {"error": f"timeout must be a number of seconds up to {threading.TIMEOUT_MAX:.0f}"}
         elif request.get("op") == "question":
             timeout = request.get("timeout")
             wait = bool(request.get("wait"))
