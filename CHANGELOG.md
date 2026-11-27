@@ -6,38 +6,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Security
+## [0.1.8] - 2026-11-27
 
-- An `amp` agent in the bubblewrap sandbox, a coding agent or a sandboxed reviewer, received
-  every `AMP_` variable, including an Amp orb's identity variables, one of which mints
-  tokens that other services trust. Its shell could read them. In the sandbox it now
-  receives only `AMP_API_KEY` and `AMP_URL`, plus the `EXTERNAL_AGENTS_ENV_PASSTHROUGH` names.
-- The `amp` reviewer's confinement no longer relies on `amp.permissions` rules, which Amp
-  removes on 2026-12-04. The generated plugin's `tool.call` hook allows only its file tools,
-  on absolute paths whose real location, links resolved, is inside the snapshot. It also
-  refuses writes to `.amp/`, so the reviewer cannot rewrite the hook.
-- A `codex` reviewer could write the configuration of the repository that records its
-  changes, next to its snapshot in `/tmp`, and make the wrapper's own `git` run commands on
-  the host (`core.fsmonitor`, filter drivers). The repository now lives under the state
-  directory, its configuration is rewritten before every git command, and no hook runs.
-- A coding agent could repoint a submodule's `.git` file, or `git init` an uninitialised
-  submodule, so the host's next `git status` ran its commands. `code` refuses worktrees
-  with submodules, and masks nested `.git` files.
-- `--ro` over the state directory let the agent answer its own questions through the
-  control socket, and `--rw` over the main checkout let it write hooks; both are refused.
-- The diff filter let secrets through in plain `diff -u` patches, CRLF patches, and headers
-  whose path contains ` b/`; it now reads hunks by their line counts and drops any text
-  it cannot attribute to a file, such as a `diff -c` section. A
-  `--diff-file` inside the checkout, and earlier review output, no longer reach the
-  snapshot unfiltered. A tracked directory replaced by a link to `.git` is no longer copied.
-- Agents receive only their own provider's credentials, not every provider's; the
-  `amp` routing check no longer gets the full parent environment. Secret names match
-  regardless of case.
-- The agent could exhaust the connection slots it shared with the coordinator and lock
-  `question` and `answer` out; each socket has its own limit.
-- The seccomp filter also denies `pidfd_getfd` and `process_madvise`. The SNI parser checks
-  every length and reads a ClientHello split across records. The proxy escapes the
-  agent's text in its log.
+### Added
+
+- `review --background` and `review-status`. Nothing told a coordinator that ran a review in
+  the background when it ended. `--background` starts the run detached and returns once it
+  is under way; every run records each slot's outcome in `review-status.json` as the slot
+  ends; `review-status --wait` blocks until the run ends, prints each slot's reviewer or
+  why it has none, and exits with the run's exit code, or 4 when the run was killed.
+  A second run into the same outputs is refused.
 
 ### Fixed
 
@@ -67,6 +45,60 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `review --background` returned the run's own exit code, such as 3, as a failure to
   start when the run ended before its first check. A run that recorded its status now
   counts as started, and its outcome comes from `review-status`.
+
+## [0.1.7] - 2026-11-27
+
+### Security
+
+- An `amp` agent in the bubblewrap sandbox, a coding agent or a sandboxed reviewer, received
+  every `AMP_` variable, including an Amp orb's identity variables, one of which mints
+  tokens that other services trust. Its shell could read them. In the sandbox it now
+  receives only `AMP_API_KEY` and `AMP_URL`, plus the `EXTERNAL_AGENTS_ENV_PASSTHROUGH` names.
+
+## [0.1.6] - 2026-11-27
+
+### Added
+
+- `EXTERNAL_AGENTS_REVIEW_SANDBOX=1` runs reviewers in the bubblewrap sandbox that `code`
+  uses, with a shell, so they can search and run the tests; `codex` is confined there too.
+  Without a working bwrap they keep file tools only.
+- The handoff diff shows whole changed functions, so reviewers open fewer files.
+- `amp` reviewers can search: the generated mode adds `search_files` (a regular expression
+  over file contents) and `find_files` (a glob over paths), confined to the snapshot like
+  its file tools. Amp has no search tool of its own, so reviewers read whole files to find
+  a definition.
+
+### Security
+
+- The `amp` reviewer's confinement no longer relies on `amp.permissions` rules, which Amp
+  removes on 2026-12-04. The generated plugin's `tool.call` hook allows only its file tools,
+  on absolute paths whose real location, links resolved, is inside the snapshot. It also
+  refuses writes to `.amp/`, so the reviewer cannot rewrite the hook.
+- A `codex` reviewer could write the configuration of the repository that records its
+  changes, next to its snapshot in `/tmp`, and make the wrapper's own `git` run commands on
+  the host (`core.fsmonitor`, filter drivers). The repository now lives under the state
+  directory, its configuration is rewritten before every git command, and no hook runs.
+- A coding agent could repoint a submodule's `.git` file, or `git init` an uninitialised
+  submodule, so the host's next `git status` ran its commands. `code` refuses worktrees
+  with submodules, and masks nested `.git` files.
+- `--ro` over the state directory let the agent answer its own questions through the
+  control socket, and `--rw` over the main checkout let it write hooks; both are refused.
+- The diff filter let secrets through in plain `diff -u` patches, CRLF patches, and headers
+  whose path contains ` b/`; it now reads hunks by their line counts and drops any text
+  it cannot attribute to a file, such as a `diff -c` section. A
+  `--diff-file` inside the checkout, and earlier review output, no longer reach the
+  snapshot unfiltered. A tracked directory replaced by a link to `.git` is no longer copied.
+- Agents receive only their own provider's credentials, not every provider's; the
+  `amp` routing check no longer gets the full parent environment. Secret names match
+  regardless of case.
+- The agent could exhaust the connection slots it shared with the coordinator and lock
+  `question` and `answer` out; each socket has its own limit.
+- The seccomp filter also denies `pidfd_getfd` and `process_madvise`. The SNI parser checks
+  every length and reads a ClientHello split across records. The proxy escapes the
+  agent's text in its log.
+
+### Fixed
+
 - A reviewer thinking for longer than `--idle-timeout` was killed as stalled. The timeout
   grows with `@effort`, a retry allows twice the silence, and a silent `amp` run is checked
   on the server: a turn still in flight earns more time, and one that finished is taken as
@@ -96,22 +128,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   opening a file into that number at the same moment. bwrap now reads the filter from the
   descriptor it was opened on (`--seccomp N`).
 
+## [0.1.5] - 2026-11-26
+
 ### Added
 
-- `review --background` and `review-status`. Nothing told a coordinator that ran a review in
-  the background when it ended. `--background` starts the run detached and returns once it
-  is under way; every run records each slot's outcome in `review-status.json` as the slot
-  ends; `review-status --wait` blocks until the run ends, prints each slot's reviewer or
-  why it has none, and exits with the run's exit code, or 4 when the run was killed.
-  A second run into the same outputs is refused.
-- `EXTERNAL_AGENTS_REVIEW_SANDBOX=1` runs reviewers in the bubblewrap sandbox that `code`
-  uses, with a shell, so they can search and run the tests; `codex` is confined there too.
-  Without a working bwrap they keep file tools only.
-- The handoff diff shows whole changed functions, so reviewers open fewer files.
-- `amp` reviewers can search: the generated mode adds `search_files` (a regular expression
-  over file contents) and `find_files` (a glob over paths), confined to the snapshot like
-  its file tools. Amp has no search tool of its own, so reviewers read whole files to find
-  a definition.
 - `EXTERNAL_AGENTS_AMP_NO_CREDITS=1` runs an `amp` reviewer only when a provider
   connection linked to the Amp account, such as a ChatGPT subscription, serves its model.
   `amp config model-providers check-access` decides before each `amp` reviewer runs; a
@@ -206,7 +226,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   CLIs are installed when missing.
 - MIT license.
 
-[Unreleased]: https://github.com/nappa85/external-agents/compare/v0.1.4...HEAD
+[Unreleased]: https://github.com/nappa85/external-agents/compare/v0.1.8...HEAD
+[0.1.8]: https://github.com/nappa85/external-agents/compare/v0.1.7...v0.1.8
+[0.1.7]: https://github.com/nappa85/external-agents/compare/v0.1.6...v0.1.7
+[0.1.6]: https://github.com/nappa85/external-agents/compare/v0.1.5...v0.1.6
+[0.1.5]: https://github.com/nappa85/external-agents/compare/v0.1.4...v0.1.5
 [0.1.4]: https://github.com/nappa85/external-agents/compare/v0.1.3...v0.1.4
 [0.1.3]: https://github.com/nappa85/external-agents/compare/v0.1.2...v0.1.3
 [0.1.2]: https://github.com/nappa85/external-agents/compare/v0.1.1...v0.1.2
