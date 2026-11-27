@@ -77,12 +77,16 @@ python3 -I <skill-dir>/scripts/external_agents.py review --background \
   --prompt-file "$PROMPT" --output-dir "$OUT_DIR" --base main
 ```
 
-Never judge from memory whether the run is still going. Run `review-status`, in the
-background next to your subagent, to wait for its end:
+Never judge from memory whether the run is still going. Run the `review-status` command
+that `--background` printed, in the background next to your subagent, to wait for its end;
+its `--run` names this run, so a later run into the same directory is never taken for it:
 
 ```bash
-python3 -I <skill-dir>/scripts/external_agents.py review-status --wait --output-dir "$OUT_DIR"
+python3 -I <skill-dir>/scripts/external_agents.py review-status --wait --output-dir "$OUT_DIR" --run "$RUN"
 ```
+
+If `--background` instead says the run already ended, its exit code is the outcome: a later
+run replaced the reviews, so start the review again.
 
 It prints one line per slot, `written by <reviewer> to <file>` or `missing, no reviewer
 available (<why>)`, and exits with the run's own exit code: 0, 3, or 2 when the wrapper

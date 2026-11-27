@@ -40,7 +40,7 @@ POLL = 1.0
 # system reused, for this run's; and the run does not detach again.
 # No prefix of it a user would type, such as `--d` for `--diff-file`, becomes ambiguous.
 DETACHED_RUN = "--xagents-detached-run"
-# The exit codes of a run that ran its slots; anything else ended it before it started.
+# The exit codes `review` returns only after it recorded its run and ran its slots.
 RAN = (0, 3)
 
 
@@ -190,18 +190,28 @@ def review_status(args: argparse.Namespace) -> int:
     deadline = None if args.timeout is None else time.monotonic() + args.timeout
     while True:
         status = read(path)
+        if args.run is not None and status is not None and status.get("run") != args.run:
+            # A later run into the same outputs replaced this run's status and reviews.
+            print(
+                f"run {args.run} was replaced by a later run into the same outputs; its reviews are gone",
+                file=sys.stderr,
+            )
+            return EXIT_NO_RUN
         if status is not None and status.get("state") == FINISHED:
             print("\n".join(describe(status)))
             code = status.get("exit")
-            return code if isinstance(code, int) else EXIT_NO_RUN
+            # bool is an int too, but never an exit code this script wrote.
+            return code if isinstance(code, int) and not isinstance(code, bool) else EXIT_NO_RUN
         running = alive(lock)
         if not running:
             # The run may have finished between the two reads.
             status = read(path)
-            if status is not None and status.get("state") == FINISHED:
+            # A new run may have taken the lock between the probe and this read.
+            if (status is not None and status.get("state") == FINISHED) or alive(lock):
                 continue
             if status is None:
-                why = "exists but could not be read as a status" if path.exists() else "does not exist"
+                # os.path.lexists never raises, unlike Path.exists on an untraversable path.
+                why = "exists but could not be read as a status" if os.path.lexists(path) else "does not exist"
                 print(f"no review run found: {path} {why}", file=sys.stderr)
             else:
                 print("\n".join(describe(status, ended=True)))
@@ -214,8 +224,9 @@ def review_status(args: argparse.Namespace) -> int:
 
 
 def background(script: Path, argv: list[str], output: Path | None, output_dir: Path | None) -> int:
-    """Start `review` detached and return once it has written its status, or with its
-    exit code when it ends first, such as on a usage error."""
+    """Start `review` detached and return 0 once it has recorded its run, or once it ran
+    its slots even if a later run already replaced its status; otherwise, such as on a usage
+    error, return its exit code."""
     lock = lock_path(output, output_dir)
     if alive(lock):
         raise UsageError(f"a review is already running with these outputs; it holds {lock}")
@@ -244,14 +255,17 @@ def background(script: Path, argv: list[str], output: Path | None, output_dir: P
         ended = child.poll() is not None
         status = read(path)
         if ended and child.returncode in RAN and (status is None or status.get("run") != run):
-            # It ran its slots, but a later run already replaced its status, so
-            # `review-status` would report that run instead.
-            print(f"review ran in the background and already ended with exit {child.returncode}; see {log}")
+            # It ran its slots, but a later run already replaced its status, reviews and
+            # run log, so `review-status` would report that run instead.
+            print(
+                f"review ran in the background and already ended with exit {child.returncode}; a later run into "
+                "the same outputs replaced its status and reviews, so do not run review-status for it"
+            )
             return 0
         if status is not None and status.get("run") == run:
             where = f"--output {output}" if output is not None else f"--output-dir {output_dir}"
             print(f"review started in the background (pid {child.pid}); its own output goes to {log}")
-            print(f"wait for it with: {script.name} review-status --wait {where}")
+            print(f"wait for it with: {script.name} review-status --wait {where} --run {run}")
             return 0
         if ended:
             # It ended without recording a run, such as on a usage error.
@@ -268,4 +282,5 @@ def add_parser(commands: argparse._SubParsersAction) -> None:
     outputs.add_argument("--output", type=Path, help="The run's --output")
     outputs.add_argument("--output-dir", type=Path, help="The run's --output-dir")
     run.add_argument("--wait", action="store_true", help="Block until the run ends")
+    run.add_argument("--run", help="The run ID that --background printed; a later run into the same outputs exits 4")
     run.add_argument("--timeout", type=float, help="With --wait, give up after this many seconds (exit 1)")

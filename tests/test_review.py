@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import argparse
+import io
 import json
 import os
 import shutil
@@ -1052,6 +1054,7 @@ class ReviewStatusTests(Sandbox):
 
         self.assertEqual(result.returncode, 4, result.stdout + result.stderr)
         self.assertIn("no review run found", result.stderr)
+        self.assertIn("does not exist", result.stderr)
 
     def test_a_background_run_that_fails_to_start_reports_its_error(self) -> None:
         result = self.run_script(
@@ -1127,20 +1130,62 @@ class ReviewStatusTests(Sandbox):
             "sys.exit(3)\n"
         )
         real_sleep = time.sleep
-        with mock.patch.object(review.status.time, "sleep", lambda _: real_sleep(1)), mock.patch("sys.stdout"):
+        out = io.StringIO()
+        with mock.patch.object(review.status.time, "sleep", lambda _: real_sleep(1)), mock.patch("sys.stdout", out):
             code = review.status.background(script, [str(self.out)], None, self.out)
 
         self.assertEqual(code, 0)
+        self.assertIn("review started in the background", out.getvalue())
+        self.assertIn("review-status --wait --output-dir", out.getvalue())
 
     def test_a_run_that_ran_but_whose_status_was_replaced_still_counts_as_started(self) -> None:
         # As if a second run replaced the status before `--background` read it: the child
         # ran its slots and exited 3, but no status carries its ID.
         script = self.root / "replaced_run.py"
-        script.write_text("import sys\nsys.exit(3)\n")
-        with mock.patch("sys.stdout"), mock.patch("sys.stderr"):
+        script.write_text(
+            "import json, os, sys\n"
+            "open(os.path.join(sys.argv[1], 'review-status.json'), 'w').write(json.dumps({'run': 'later'}))\n"
+            "sys.exit(3)\n"
+        )
+        out = io.StringIO()
+        with mock.patch("sys.stdout", out), mock.patch("sys.stderr"):
             code = review.status.background(script, [str(self.out)], None, self.out)
 
         self.assertEqual(code, 0)
+        self.assertIn("already ended with exit 3", out.getvalue())
+        self.assertNotIn("review-status --wait", out.getvalue())
+
+    def test_a_boolean_exit_is_not_taken_as_an_exit_code(self) -> None:
+        self.out.mkdir()
+        for value in (True, False):
+            with self.subTest(exit=value):
+                status = {"state": "finished", "finished": "now", "exit": value, "slots": []}
+                (self.out / "review-status.json").write_text(json.dumps(status))
+
+                self.assertEqual(self.status().returncode, 4)
+
+    def test_status_with_a_run_id_does_not_report_a_later_run(self) -> None:
+        self.out.mkdir()
+        later = {"state": "finished", "finished": "now", "exit": 0, "run": "later", "slots": []}
+        (self.out / "review-status.json").write_text(json.dumps(later))
+
+        result = self.status("--wait", "--run", "mine")
+
+        self.assertEqual(result.returncode, 4, result.stdout + result.stderr)
+        self.assertIn("was replaced by a later run", result.stderr)
+        self.assertEqual(self.status("--run", "later").returncode, 0)
+
+    def test_a_run_that_takes_the_lock_between_probe_and_read_is_not_reported_killed(self) -> None:
+        self.out.mkdir()
+        slot = {"slot": 1, "chain": ["amp:p/fast"], "state": "running", "log": "review-1.log"}
+        (self.out / "review-status.json").write_text(json.dumps({"state": "running", "slots": [slot]}))
+        args = argparse.Namespace(output=None, output_dir=self.out, wait=False, timeout=None, run=None)
+
+        # The first probe finds no holder; the new run holds the lock by the second.
+        with mock.patch.object(review.status, "alive", side_effect=[False, True, True]), mock.patch("sys.stdout"):
+            code = review.status.review_status(args)
+
+        self.assertEqual(code, 1)
 
     def test_the_hidden_run_option_leaves_short_prefixes_unambiguous(self) -> None:
         self.release.touch()
@@ -1180,7 +1225,16 @@ class ReviewStatusTests(Sandbox):
 
     def test_a_malformed_status_counts_as_no_run(self) -> None:
         self.out.mkdir()
-        for slots in (5, [5], [{"chain": 5}], [{"chain": 0}], [{"chain": {}}], [{"state": "missing", "reasons": [5]}]):
+        for slots in (
+            5,
+            [5],
+            [{"chain": 5}],
+            [{"chain": 0}],
+            [{"chain": {}}],
+            [{"reasons": 0}],
+            [{"reasons": ""}],
+            [{"state": "missing", "reasons": [5]}],
+        ):
             with self.subTest(slots=slots):
                 (self.out / "review-status.json").write_text(json.dumps({"state": "finished", "slots": slots}))
 

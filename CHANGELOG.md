@@ -46,6 +46,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `--background` says when a run already ended before it saw its status. A run that
   ran its slots counts as started even when a second run replaced its status first, and
   `review-status` names a status file it cannot read instead of saying it does not exist.
+- `review-status` could report a later run into the same outputs as the run a coordinator
+  started. `--background` now prints the command with `--run <id>`, and `review-status
+  --run` exits 4 when another run replaced that one. A run that took the lock between
+  `review-status`'s two checks is no longer reported as killed.
 - `review --background` could take an earlier run's status for the new run's when the
   system reused the earlier run's pid, and report the old outcome. It now gives the run an
   ID and accepts only a status that carries it. A status file with malformed slot fields

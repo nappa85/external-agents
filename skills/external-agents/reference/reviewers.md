@@ -163,8 +163,8 @@ python3 -I <skill-dir>/scripts/external_agents.py review \
 
 Slots run in parallel, so a panel takes about as long as its slowest slot; a review can
 take several minutes. Start it with `--background` next to your own subagent, not with a
-shell's `&`: `--background` returns only once the run has replaced any earlier run's
-status, so `review-status` never reports the previous run.
+shell's `&`: `--background` returns only once the run has recorded its status, and prints a
+`review-status` command whose `--run` names the run, so it never reports another run.
 
 `review` exits:
 
@@ -177,8 +177,11 @@ status, so `review-status` never reports the previous run.
 ### Follow a run
 
 `--background` starts the run detached, writes its own output to `review-run.log` in the
-output directory (`<name>.run.log` next to `--output`), and returns as soon as the run is
-under way, or with the run's exit code when it fails to start, such as on a usage error.
+output directory (`<name>.run.log` next to `--output`), and returns 0 as soon as the run has
+recorded its status. When the run fails to start, such as on a usage error, it returns the
+run's exit code instead. When the run already ended and a later run into the same outputs
+replaced its status, it says so with the run's exit code and returns 0: that exit code is
+the outcome, and `review-status` would describe the later run.
 Any run, in the background or not, records its progress in `review-status.json`
 (`<name>.status.json`): each slot's reviewer chain, and its outcome as soon as the slot
 ends.
@@ -190,7 +193,9 @@ python3 -I <skill-dir>/scripts/external_agents.py review-status --wait --output-
 `review-status` reads that file and prints the run, then one line per slot: `written by
 <reviewer> to <file>`, with the patch when there is one, `missing, no reviewer available
 (<why>)`, or `running (<chain>)` with its log. `--wait` blocks until the run ends;
-`--timeout <s>` bounds the wait. Pass the same `--output-dir` or `--output` as the run.
+`--timeout <s>` bounds the wait. Pass the same `--output-dir` or `--output` as the run, and
+the `--run` ID that `--background` printed: when a later run into the same outputs has
+replaced this one, `review-status` exits 4 instead of reporting the later run.
 
 | Exit   | Meaning                                                                     |
 | ------ | --------------------------------------------------------------------------- |

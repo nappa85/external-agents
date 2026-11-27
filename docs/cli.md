@@ -129,6 +129,7 @@ missing (each reviewer's failure), or running (its chain and log).
 | ------------------ | -------------------------------------------------------- |
 | `--output-dir DIR` | the run's `--output-dir` (or `--output FILE`)            |
 | `--wait`           | block until the run ends                                 |
+| `--run ID`         | the ID `--background` printed; another run exits 4       |
 | `--timeout S`      | with `--wait`, stop waiting after S seconds              |
 
 Exit: the run's exit code once it finished; 1 while it runs; 4 no run, or it ended
